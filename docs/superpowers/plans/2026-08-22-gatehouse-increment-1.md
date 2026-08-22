@@ -1161,6 +1161,30 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
 Run: `npx vitest run test/unit/v1.test.ts`
 Expected: PASS, 10 tests
 
+> **Amended during Task 5 review.** The code above is the starting shape; it is missing the
+> input validation this boundary owes the browser behind it. `handleV1` is where an untrusted
+> JSON body becomes a real Chromium navigation and a real filesystem partition name, so it
+> must additionally:
+>
+> - **Allow only `http:` and `https:` URLs.** Without a scheme allow-list,
+>   `{"cmd":"request.get","url":"file:///C:/Users/you/.ssh/id_rsa"}` is handed to the browser
+>   and the file comes back to the caller in `solution.response` — arbitrary local file read
+>   through a local service.
+> - **Validate a caller-supplied `session` against `/^[A-Za-z0-9._-]{1,64}$/`** (and reject
+>   all-dots names). It becomes `persist:<session>`; `../../../../etc` is path traversal.
+> - **Sanitize a *derived* session** rather than rejecting it: lowercase, replace anything
+>   outside `[a-z0-9.-]` with `-`, truncate to 64, fall back to `default`. IPv6 hosts arrive
+>   as `[::1]`, whose brackets and colons are not legal path components.
+> - **Fall back to `default` when `hostname` is empty**, not only when parsing throws —
+>   `mailto:`, `file:`, `data:` and `about:` URLs all parse fine with no host.
+> - **Clamp `maxTimeout` to at most 300000.**
+>
+> Every one of these rejections goes through the existing `fail()` — HTTP **500** with the
+> error shape. A 400 would read as more correct and would be a protocol deviation.
+>
+> The Task 5 tests must also pin *pass-through fidelity* (the handler must not reshape
+> `solution`) rather than asserting fields on the mock's own fixture, which is tautological.
+
 - [ ] **Step 5: Commit**
 
 ```bash
