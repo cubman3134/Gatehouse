@@ -59,7 +59,10 @@ function attach(ses: Electron.Session, webContentsId: number): FrameState {
   let hook = hooks.get(ses);
   if (hook === undefined) {
     const created: SessionHook = { refs: 0, byWebContents: new Map() };
-    hooks.set(ses, created);
+    // Register FIRST, publish second. If the registration threw after `hooks.set`, the map
+    // would hold a live-looking entry with no listener behind it — the next solve would
+    // attach to it and run blind (status 0, headers {}), which is the exact fail-open this
+    // whole structure exists to close.
     ses.webRequest.onHeadersReceived((details, cb) => {
       if (details.resourceType === 'mainFrame' && details.webContentsId !== undefined) {
         const state = created.byWebContents.get(details.webContentsId);
@@ -70,6 +73,7 @@ function attach(ses: Electron.Session, webContentsId: number): FrameState {
       }
       cb({});
     });
+    hooks.set(ses, created);
     hook = created;
   }
 
@@ -119,7 +123,11 @@ export function makeSolver(pool: BrowserPool): Solver {
     try {
       const wc = win.webContents;
       const ses = wc.session;
-      const frame = attach(ses, wc.id);
+      // Capture the id now. `detach` runs in a finally that is also reached from the
+      // window-destroyed path, and reading `.id` off a destroyed webContents there could
+      // throw and mask the real browser-crashed error.
+      const wcId = wc.id;
+      const frame = attach(ses, wcId);
 
       try {
         const deadline = Date.now() + req.maxTimeout;
@@ -213,7 +221,7 @@ export function makeSolver(pool: BrowserPool): Solver {
         }
         throw e;
       } finally {
-        detach(ses, wc.id);
+        detach(ses, wcId);
       }
     } finally {
       pool.release(win);
