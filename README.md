@@ -85,7 +85,7 @@ All configuration is environment variables; there is no config file.
 | `GATEHOUSE_BIND` | `127.0.0.1` | Bind address. Non-loopback requires a token. |
 | `GATEHOUSE_TOKEN` | *(none)* | Bearer token. Mandatory for a non-loopback bind. |
 | `GATEHOUSE_CONCURRENCY` | `2` | Simultaneous browser windows, 1–16. |
-| `GATEHOUSE_SOLVE_TIMEOUT_MS` | `70000` | Server-side ceiling on one solve, 1000–600000. |
+| `GATEHOUSE_SOLVE_TIMEOUT_MS` | `70000` | Server-side ceiling on one solve, 1000–600000 — but see below: anything above 300000 is inert. |
 
 A bad value is a startup failure with the range in the message, not a silent fallback.
 
@@ -111,12 +111,21 @@ reads exactly two things out of a success: `solution.userAgent`, and the entry i
 `solution.cookies` whose `name` is `cf_clearance`. Everything else is there for
 compatibility with other callers.
 
-**Every rejection is an HTTP 500 carrying the FlareSolverr error body**
+**Every rejection of a well-formed POST is an HTTP 500 carrying the FlareSolverr error body**
 (`{"status":"error","message":…}`) — never a 400, never a 200 with an error inside.
 That is deliberate: a FlareSolverr client already degrades on any non-2xx, and a
 malformed request that came back 200 would be read as a success with no clearance
 cookie and no way to tell why. Bad JSON, an over-long body, an unknown command and a
-failed solve all take the same route.
+failed solve all take the same route. (A request that is not a well-formed POST is
+answered earlier and differently: an unauthenticated request on a non-loopback bind gets
+`401`, and a non-POST to `/v1` gets `405`.)
+
+There are **two** ceilings on a solve, and the effective deadline is the smaller of three
+numbers: `min(the client's maxTimeout, 300000, GATEHOUSE_SOLVE_TIMEOUT_MS)`. The `300000`
+is a fixed cap applied to the client-supplied value before the operator ceiling is
+consulted, so setting `GATEHOUSE_SOLVE_TIMEOUT_MS` above 300000 has no effect — the
+config layer accepts it up to 600000 without complaining, which is a wart worth knowing
+about rather than a feature.
 
 Two inputs are validated more strictly than FlareSolverr validates them:
 
