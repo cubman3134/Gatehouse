@@ -207,6 +207,24 @@ export async function transfer(
     // the byte we asked for. Anything else — a 200, no `content-range`, or one starting
     // elsewhere — is a body we cannot append to, so the partial goes.
     const claimedStart = res.status === 206 ? rangeStart(res.headers['content-range']) : null;
+
+    // A 206 claiming a THIRD offset — neither what we asked for nor zero — is unusable in both
+    // directions: appending puts the wrong bytes at `have`, and restarting writes a body that
+    // does not begin at byte zero. Either way the length check still passes and the file is
+    // marked done with a wrong sha256 of a wrong file. Refuse the body instead of writing it.
+    if (claimedStart !== null && claimedStart !== have && claimedStart !== 0) {
+      await store.update(id, {
+        state: 'failed',
+        error: {
+          code: 'http-error',
+          message:
+            `server answered 206 from byte ${claimedStart}, but we asked from ${have}; ` +
+            `its body cannot be placed correctly`,
+        },
+      });
+      return;
+    }
+
     const appending = have > 0 && res.status === 206 && claimedStart === have;
     if (have > 0 && !appending) {
       log.info('server ignored the range request, restarting the download', {

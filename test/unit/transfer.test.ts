@@ -94,6 +94,26 @@ describe('transfer', () => {
     expect(s.get(r.id)?.sha256).toBe(SHA);
   });
 
+  // A 206 from a third offset is unusable in BOTH directions: appending puts the wrong bytes
+  // at `have`, and restarting writes a body that does not begin at byte zero. Either way the
+  // length check still passes and the record is marked done with a wrong sha256 of a wrong
+  // file. Refusing the body is the only safe answer.
+  it('refuses a 206 that starts at neither the requested offset nor zero', async () => {
+    host = await startFileHost({ mode: 'shifted-206' });
+    const s = mkStore(); await s.load();
+    const r = await s.create({ url: host.url, session: 'h', referer: null });
+    await writeFile(s.partPath(r.id), BODY.subarray(0, 10));
+
+    await transfer(r.id, s, nodeRequester, new AbortController().signal);
+
+    const rec = s.get(r.id)!;
+    expect(rec.state).toBe('failed');
+    expect(rec.error?.code).toBe('http-error');
+    expect(rec.error?.message).toMatch(/206 from byte 5/);
+    // Nothing was written: no finished file, and the record is not `done`.
+    await expect(stat(s.filePath(r.id))).rejects.toThrow();
+  });
+
   it('records an http-error for a non-2xx and writes no file', async () => {
     const s = mkStore(); await s.load();
     const r = await s.create({ url: 'http://127.0.0.1:1/nope', session: 'h', referer: null });

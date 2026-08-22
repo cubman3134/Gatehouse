@@ -18,11 +18,13 @@ export interface FileHostOptions {
    *                dynamically generated or proxied download arrives.
    * 'no-headers' — accepts the socket and sends nothing, ever: not even a status line. This is
    *                the request phase hanging, which is a different fault from 'stall'.
+   * 'shifted-206' — answers a ranged request with 206 from a THIRD offset (5), neither what
+   *                 was asked for nor zero. Its body cannot be placed correctly either way.
    * 'lying-206'  — answers a ranged request with 206 but a content-range of `bytes 0-n-1/n`
    *                and the whole body, the way some proxies and CDNs do. Appending that to a
    *                partial is exactly the silent corruption the transfer guard exists to stop.
    */
-  mode?: 'range' | 'no-range' | 'truncate' | 'stall' | 'chunked' | 'no-headers' | 'lying-206';
+  mode?: 'range' | 'no-range' | 'truncate' | 'stall' | 'chunked' | 'no-headers' | 'lying-206' | 'shifted-206';
   body?: Buffer;
   filename?: string;
 }
@@ -60,6 +62,17 @@ export async function startFileHost(opts: FileHostOptions = {}): Promise<FileHos
       const half = Math.ceil(body.length / 2);
       res.write(body.subarray(0, half));
       res.end(body.subarray(half));
+      return;
+    }
+
+    if (mode === 'shifted-206') {
+      const from = 5;
+      res.writeHead(206, {
+        ...common,
+        'content-range': `bytes ${from}-${body.length - 1}/${body.length}`,
+        'content-length': String(body.length - from),
+      });
+      res.end(body.subarray(from));
       return;
     }
 
