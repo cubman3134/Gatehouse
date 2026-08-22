@@ -17,7 +17,16 @@ export interface Solution {
   response: string;
 }
 
+/** The two /v1 commands that reach the browser. */
+export type SolveCommand = 'request.get' | 'request.post';
+
 export interface SolveRequest {
+  /**
+   * Carried through because a solve is not identified by its URL alone: a `request.post`
+   * with no body and a `request.get` to the same URL are different navigations, and without
+   * this the queue's dedupe key collapses them onto one job.
+   */
+  cmd: SolveCommand;
   url: string;
   session: string;
   maxTimeout: number;
@@ -32,6 +41,12 @@ export interface V1Deps {
   version: string;
   /** Session names created via sessions.create. Partitions are created lazily regardless. */
   sessions: Set<string>;
+  /**
+   * Tear down everything a session name owns — the pooled window and the partition on disk.
+   * Optional: without it `sessions.destroy` only forgets the name, which is what the pure
+   * unit tests exercise. Wired in `main.ts`, where Electron is actually available.
+   */
+  destroySession?: (name: string) => Promise<void>;
 }
 
 const DEFAULT_MAX_TIMEOUT = 60_000;
@@ -143,6 +158,18 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
         return fail(deps, startTimestamp, badSession(session));
       }
       deps.sessions.delete(session);
+      // Forgetting the name is not destroying the session: the `persist:` partition, its
+      // cookies on disk and the pooled idle window all outlive it, so the next solve on that
+      // name would resume with the very cf_clearance the caller asked to be rid of. An empty
+      // name is not a session — `persist:` is not a partition — so nothing is torn down for
+      // it, which matches the pre-existing behaviour of answering ok.
+      if (deps.destroySession && session) {
+        try {
+          await deps.destroySession(session);
+        } catch (e: unknown) {
+          return fail(deps, startTimestamp, e instanceof Error ? e.message : String(e));
+        }
+      }
       return ok(deps, startTimestamp, {});
     }
     case 'request.get':
@@ -184,7 +211,7 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
         // `parsed`, so handing the browser anything else leaves a gap between what we
         // inspected and what gets fetched. Node and Chromium both implement WHATWG parsing,
         // so no divergence is known — this closes the class rather than a specific case.
-        const solution = await deps.solve({ url: parsed.href, session, maxTimeout, postData });
+        const solution = await deps.solve({ cmd, url: parsed.href, session, maxTimeout, postData });
         return ok(deps, startTimestamp, { solution });
       } catch (e: unknown) {
         return fail(deps, startTimestamp, e instanceof Error ? e.message : String(e));

@@ -1,4 +1,4 @@
-import { app } from 'electron';
+import { app, session as electronSession } from 'electron';
 import { loadConfig } from './config.js';
 import { BrowserPool } from './browser/pool.js';
 import { makeSolver } from './browser/solve.js';
@@ -14,6 +14,9 @@ const version = (createRequire(import.meta.url)('../package.json') as { version:
 // A headless solver has no dock/taskbar presence and must not quit when its last hidden
 // window closes.
 app.on('window-all-closed', () => { /* keep running */ });
+
+/** What to print for a bind that names no reachable address of its own. */
+const WILDCARD_LOOPBACK: Record<string, string> = { '0.0.0.0': '127.0.0.1', '::': '[::1]' };
 
 async function start(): Promise<void> {
   const cfg = loadConfig(process.env);
@@ -37,9 +40,14 @@ async function start(): Promise<void> {
         ...incoming,
         maxTimeout: Math.min(incoming.maxTimeout, cfg.solveTimeoutMs),
       };
-      // NUL-separated: NUL cannot occur in a session name, a URL, or form-encoded post data,
-      // so no two distinct requests can collide onto one dedupe key.
-      const job = queue.submit(`${req.session}\u0000${req.url}\u0000${req.postData ?? ''}`, req);
+      // NUL-separated: NUL cannot occur in a command, a session name, a URL, or form-encoded
+      // post data, so no two distinct requests can collide onto one dedupe key. The command
+      // leads because without it a `request.post` carrying no body and a `request.get` to the
+      // same URL share a key — and the GET caller is then handed a POST navigation's result.
+      const job = queue.submit(
+        `${req.cmd}\u0000${req.session}\u0000${req.url}\u0000${req.postData ?? ''}`,
+        req,
+      );
       const settled = await queue.wait(job.id);
       if (settled.state === 'done' && settled.result) return settled.result;
       throw Object.assign(new Error(settled.error?.message ?? 'solve failed'), { code: settled.error?.code });
@@ -47,6 +55,12 @@ async function start(): Promise<void> {
     now: () => Date.now(),
     version,
     sessions: new Set<string>(),
+    // Destroy means destroy: the warm window goes, then the cookies on disk. Either alone
+    // leaves the cleared token in play for the next solve on this name.
+    destroySession: async (name) => {
+      pool.destroySession(name);
+      await electronSession.fromPartition(`persist:${name}`).clearStorageData();
+    },
   };
 
   const health = () => ({
@@ -56,8 +70,11 @@ async function start(): Promise<void> {
   });
 
   const server = await startServer(cfg, deps, health);
-  // The integration harness waits for this exact line.
-  process.stdout.write(`GATEHOUSE_READY http://${cfg.bind}:${server.port}\n`);
+  // The integration harness waits for this exact line, and a human pastes it into a client —
+  // so it has to be dialable. A wildcard bind is an instruction to `listen`, not an address:
+  // `http://0.0.0.0:8191` connects nowhere useful. Advertise the loopback the wildcard covers.
+  const host = WILDCARD_LOOPBACK[cfg.bind] ?? cfg.bind;
+  process.stdout.write(`GATEHOUSE_READY http://${host}:${server.port}\n`);
   app.on('before-quit', () => { pool.destroy(); void server.close(); });
 }
 

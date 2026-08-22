@@ -56,7 +56,7 @@ describe('handleV1', () => {
     const solve = vi.fn(async () => solution);
     await handleV1({ cmd: 'request.get', url: 'http://example.test/' }, deps({ solve }));
 
-    expect(solve).toHaveBeenCalledWith({ url: 'http://example.test/', session: 'example.test', maxTimeout: 60000, postData: undefined });
+    expect(solve).toHaveBeenCalledWith({ cmd: 'request.get', url: 'http://example.test/', session: 'example.test', maxTimeout: 60000, postData: undefined });
   });
 
   it('passes an explicit session through', async () => {
@@ -83,6 +83,55 @@ describe('handleV1', () => {
 
     await handleV1({ cmd: 'sessions.destroy', session: 'vimm' }, d);
     expect(d.sessions.has('vimm')).toBe(false);
+  });
+
+  // Deleting the name is the cosmetic half. What the caller actually asked for is that the
+  // cleared token stop working, and only the callback does that.
+  it('hands sessions.destroy to the destroySession callback', async () => {
+    const destroySession = vi.fn(async () => {});
+    const d = deps({ destroySession, sessions: new Set(['vimm']) });
+
+    const { httpStatus } = await handleV1({ cmd: 'sessions.destroy', session: 'vimm' }, d);
+
+    expect(httpStatus).toBe(200);
+    expect(destroySession).toHaveBeenCalledTimes(1);
+    expect(destroySession).toHaveBeenCalledWith('vimm');
+    expect(d.sessions.has('vimm')).toBe(false);
+  });
+
+  // The callback is optional so the pure unit path needs no Electron; a destroy without one
+  // must still answer the ok shape rather than throwing on an absent dependency.
+  it('answers ok for sessions.destroy when no destroySession callback is supplied', async () => {
+    const d = deps({ sessions: new Set(['vimm']) });
+    expect(d.destroySession).toBeUndefined();
+
+    const { httpStatus, body } = await handleV1({ cmd: 'sessions.destroy', session: 'vimm' }, d);
+
+    expect(httpStatus).toBe(200);
+    expect((body as any).status).toBe('ok');
+  });
+
+  // `persist:` is not a partition, so there is nothing to tear down for a nameless destroy.
+  it('does not invoke destroySession for an empty session name', async () => {
+    const destroySession = vi.fn(async () => {});
+    const { httpStatus } = await handleV1({ cmd: 'sessions.destroy' }, deps({ destroySession }));
+
+    expect(httpStatus).toBe(200);
+    expect(destroySession).not.toHaveBeenCalled();
+  });
+
+  // The command is part of a solve's identity: main.ts keys the dedupe on it, and it cannot
+  // do that if /v1 never forwards it.
+  it('forwards the command so a GET and a bodyless POST are distinguishable', async () => {
+    const solve = vi.fn(async () => solution);
+    await handleV1({ cmd: 'request.get', url: 'http://example.test/' }, deps({ solve }));
+    await handleV1({ cmd: 'request.post', url: 'http://example.test/' }, deps({ solve }));
+
+    expect((solve.mock.calls[0] as any)[0].cmd).toBe('request.get');
+    expect((solve.mock.calls[1] as any)[0].cmd).toBe('request.post');
+    // Same URL, same (absent) body: without `cmd` these two are indistinguishable.
+    expect((solve.mock.calls[0] as any)[0].postData).toBeUndefined();
+    expect((solve.mock.calls[1] as any)[0].postData).toBeUndefined();
   });
 
   // Allarr treats any non-2xx as "FlareSolverr is unavailable" and degrades, which is

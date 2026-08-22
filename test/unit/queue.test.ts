@@ -167,6 +167,99 @@ describe('JobQueue', () => {
     expect(q.busy).toBe(2);
   });
 
+  // A settled job holds a whole Solution — page HTML included — and this process runs for
+  // weeks. Retaining them is a gigabyte-scale leak, so the record goes once it is answered.
+  it('retains no record for a job that has settled and been waited on', async () => {
+    const q = new JobQueue<string, string>({
+      concurrency: 1,
+      idgen: ids(),
+      now: () => 0,
+      run: async () => 'a'.repeat(1024),
+    });
+
+    for (let i = 0; i < 5; i++) {
+      const job = q.submit(`key-${i}`, 'x');
+      expect(q.size).toBe(1);
+      const done = await q.wait(job.id);
+      // The waiter still has its answer; only the queue's own bookkeeping went.
+      expect(done.result).toBe('a'.repeat(1024));
+      expect(q.size).toBe(0);
+    }
+
+    expect(q.size).toBe(0);
+    expect(q.depth).toBe(0);
+    expect(q.busy).toBe(0);
+  });
+
+  // The dedupe index is a second map keyed by the caller's key. Pruning `jobs` alone would
+  // just move the leak into it.
+  it('drops the dedupe index entry along with the settled job', async () => {
+    const q = new JobQueue<string, string>({ concurrency: 1, idgen: ids(), now: () => 0, run: async () => 'ok' });
+
+    await q.wait(q.submit('same', 'x').id);
+    expect(q.size).toBe(0);
+
+    // A repeat of the same key must still start fresh work rather than resolving from a
+    // record that is no longer there.
+    const b = q.submit('same', 'x');
+    expect(b.id).toBe('job-2');
+    expect(q.depth).toBe(1);
+    const done = await q.wait(b.id);
+    expect(done.state).toBe('done');
+    expect(q.size).toBe(0);
+  });
+
+  // A failed job leaks exactly as readily as a done one.
+  it('retains no record for a job that failed', async () => {
+    const q = new JobQueue<string, string>({
+      concurrency: 1,
+      idgen: ids(),
+      now: () => 0,
+      run: async () => { throw new Error('nope'); },
+    });
+
+    const done = await q.wait(q.submit('k', 'x').id);
+    expect(done.state).toBe('failed');
+    expect(q.size).toBe(0);
+  });
+
+  // Chromium rejects loadURL with its own vocabulary (ERR_CONNECTION_REFUSED and friends).
+  // Casting those into a field typed FailureCode is a type lie; they are network faults.
+  it('rejects a foreign code and files it as network, keeping the message', async () => {
+    const q = new JobQueue<string, string>({
+      concurrency: 1,
+      idgen: ids(),
+      now: () => 0,
+      run: async () => {
+        throw Object.assign(new Error('ERR_CONNECTION_REFUSED (-102) loading http://x/'), {
+          code: 'ERR_CONNECTION_REFUSED',
+        });
+      },
+    });
+
+    const done = await q.wait(q.submit('k', 'x').id);
+    expect(done.error?.code).toBe('network');
+    expect(done.error?.message).toBe('ERR_CONNECTION_REFUSED (-102) loading http://x/');
+  });
+
+  it('keeps every code that really is a FailureCode', async () => {
+    const codes = [
+      'challenge-failed', 'pending-timeout', 'blocked', 'http-error',
+      'network', 'cancelled', 'browser-crashed', 'disk-full',
+    ];
+
+    for (const code of codes) {
+      const q = new JobQueue<string, string>({
+        concurrency: 1,
+        idgen: ids(),
+        now: () => 0,
+        run: async () => { throw Object.assign(new Error('x'), { code }); },
+      });
+      const done = await q.wait(q.submit('k', 'x').id);
+      expect(done.error?.code).toBe(code);
+    }
+  });
+
   it('returns undefined for an unknown id and rejects a wait on one', async () => {
     const q = new JobQueue<string, string>({ concurrency: 1, idgen: ids(), now: () => 0, run: async () => 'ok' });
     expect(q.get('nope')).toBeUndefined();
