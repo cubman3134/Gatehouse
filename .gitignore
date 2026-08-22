@@ -7,3 +7,4 @@ downloads/
 .env
 .env.*
 appsettings.local.json
+run-gatehouse.bat
