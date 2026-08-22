@@ -1,6 +1,11 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DownloadStore } from '../../src/downloads/store.js';
+import type { GhDeps } from '../../src/api/gh.js';
 import { startServer, PortInUseError, type ServerHandle } from '../../src/api/server.js';
 import type { V1Deps, Solution } from '../../src/api/v1.js';
 import { ConfigError, loadConfig } from '../../src/config.js';
@@ -16,7 +21,22 @@ const deps = (): V1Deps => ({ solve: vi.fn(async () => solution), now: () => 1, 
 const health = () => ({ version: 'test', browsers: { busy: 0, total: 0 }, queue: { depth: 0 } });
 
 let h: ServerHandle | undefined;
-afterEach(async () => { await h?.close(); h = undefined; });
+let ghDir: string | undefined;
+afterEach(async () => {
+  await h?.close(); h = undefined;
+  if (ghDir) { await rm(ghDir, { recursive: true, force: true }); ghDir = undefined; }
+});
+
+/** A real store over a scratch directory — `GhDeps.store` is the class, not an interface. */
+const ghDeps = async (): Promise<GhDeps & { submitted: string[] }> => {
+  ghDir = await mkdtemp(join(tmpdir(), 'gh-server-'));
+  const store = new DownloadStore({
+    dir: ghDir, now: () => 1, idgen: () => 'd1', ttlMs: 60_000, maxBytes: 1_000_000,
+  });
+  await store.load();
+  const submitted: string[] = [];
+  return { store, submit: (id) => submitted.push(id), cancel: () => {}, now: () => 1, submitted };
+};
 
 describe('startServer', () => {
   it('serves /v1 on a loopback bind with no Authorization header', async () => {
@@ -37,6 +57,52 @@ describe('startServer', () => {
     const res = await fetch(`http://127.0.0.1:${h.port}/gh/health`);
     expect(res.status).toBe(200);
     expect((await res.json() as any).version).toBe('test');
+  });
+
+  // `/gh/*` is mounted only when a store is wired in. Increment 1's server tests pass no
+  // `gh` argument and must keep getting the router's own 404 for these paths.
+  it('404s /gh/fetch when no download store is wired in', async () => {
+    h = await startServer(loadConfig({ GATEHOUSE_PORT: '0' }), deps(), health);
+    const res = await fetch(`http://127.0.0.1:${h.port}/gh/fetch`, { method: 'POST', body: '{}' });
+    expect(res.status).toBe(404);
+  });
+
+  it('routes /gh/* when a download store is wired in', async () => {
+    const gh = await ghDeps();
+    h = await startServer(loadConfig({ GATEHOUSE_PORT: '0' }), deps(), health, gh);
+
+    const res = await fetch(`http://127.0.0.1:${h.port}/gh/fetch`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'http://example.test/thing.bin' }),
+    });
+    expect(res.status).toBe(202);
+    const { jobId } = await res.json() as any;
+    expect(gh.submitted).toEqual([jobId]);
+
+    const job = await fetch(`http://127.0.0.1:${h.port}/gh/jobs/${jobId}`);
+    expect(job.status).toBe(200);
+    expect((await job.json() as any).state).toBe('queued');
+  });
+
+  // `/gh/*` has its own error shape. `/v1` keeps FlareSolverr's — different contracts, and a
+  // 500-for-everything there would be wrong here.
+  it('answers a bad /gh/fetch with a 400 and the gh error shape', async () => {
+    const gh = await ghDeps();
+    h = await startServer(loadConfig({ GATEHOUSE_PORT: '0' }), deps(), health, gh);
+    const res = await fetch(`http://127.0.0.1:${h.port}/gh/fetch`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'file:///etc/passwd' }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json() as any).error.code).toBe('bad-request');
+  });
+
+  // A path `handleGh` does not own must still fall through to the router's own 404, even
+  // when a store IS wired in.
+  it('404s a non-gh path with a store wired in', async () => {
+    const gh = await ghDeps();
+    h = await startServer(loadConfig({ GATEHOUSE_PORT: '0' }), deps(), health, gh);
+    expect((await fetch(`http://127.0.0.1:${h.port}/gh/nope`)).status).toBe(404);
   });
 
   it('404s an unknown path', async () => {

@@ -2,7 +2,9 @@ node_modules/
 dist/
 out/
 build/
-downloads/
+# Anchored: an unanchored `downloads/` also matches src/downloads/, which silently
+# dropped source files from commits until it was caught reviewing increment 2 task 1.
+/downloads/
 *.log
 .env
 .env.*

@@ -1,3 +1,11 @@
+import { badSession, isTargetError, SESSION_NAME, validSession, validateTarget } from './target.js';
+
+/**
+ * Re-exported: the pattern moved to `target.ts` so `/gh/fetch` shares it, but `/v1` is the
+ * surface that has always published it and importers must not have to chase the move.
+ */
+export { SESSION_NAME };
+
 export interface SolvedCookie {
   name: string;
   value: string;
@@ -51,50 +59,6 @@ export interface V1Deps {
 
 const DEFAULT_MAX_TIMEOUT = 60_000;
 const MAX_MAX_TIMEOUT = 300_000;
-const MAX_SESSION_LENGTH = 64;
-
-/**
- * A session name becomes a Chromium partition (`persist:<session>`) and from there a
- * directory on disk, so it is restricted to characters that cannot walk out of it.
- */
-export const SESSION_NAME = /^[A-Za-z0-9._-]{1,64}$/;
-
-/** `.` and `..` clear the charset but are filesystem specials, not names. */
-function allDots(value: string): boolean {
-  return /^\.+$/.test(value);
-}
-
-/** A caller-supplied session is accepted verbatim or not at all. */
-function validSession(value: string): boolean {
-  return SESSION_NAME.test(value) && !allDots(value);
-}
-
-/** The value is echoed because the caller sent it; it is a partition label, not a secret. */
-function badSession(value: string): string {
-  return `session must match ${SESSION_NAME.source} and not be all dots: ${value}`;
-}
-
-/**
- * A derived session is sanitized rather than rejected — the caller did not choose it, and
- * hosts legitimately carry characters a path cannot (an IPv6 literal arrives as `[::1]`).
- */
-function sanitizeSession(host: string): string {
-  const cleaned = host.toLowerCase().replace(/[^a-z0-9.-]/g, '-').slice(0, MAX_SESSION_LENGTH);
-  return !cleaned || allDots(cleaned) ? 'default' : cleaned;
-}
-
-/** Session name derived from a URL when the caller supplies none. */
-function sessionFor(url: string): string {
-  let hostname: string;
-  try {
-    hostname = new URL(url).hostname;
-  } catch {
-    return 'default';
-  }
-  // `mailto:`, `data:`, `about:` and friends parse cleanly with no host at all.
-  return hostname ? sanitizeSession(hostname) : 'default';
-}
-
 function ok(deps: V1Deps, startTimestamp: number, extra: Record<string, unknown>) {
   return {
     httpStatus: 200,
@@ -174,44 +138,25 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
     }
     case 'request.get':
     case 'request.post': {
-      const url = typeof req.url === 'string' ? req.url : '';
-      if (!url) return fail(deps, startTimestamp, 'url is required for ' + cmd);
-
-      // The URL is handed to a real browser. Without a scheme allow-list, `file:` turns this
-      // into an arbitrary local-file reader that answers over the wire.
-      let parsed: URL;
-      try {
-        parsed = new URL(url);
-      } catch {
-        return fail(deps, startTimestamp, `url is not a valid URL: ${url}`);
-      }
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        return fail(
-          deps,
-          startTimestamp,
-          `url scheme ${parsed.protocol} is not supported; only http and https are`,
-        );
-      }
-
-      const suppliedSession = typeof req.session === 'string' && req.session ? req.session : '';
-      if (suppliedSession && !validSession(suppliedSession)) {
-        return fail(deps, startTimestamp, badSession(suppliedSession));
-      }
+      // The same gate `/gh/fetch` uses: the scheme allow-list, and reject-vs-sanitize on the
+      // session name. Only the rendering of a rejection differs — /v1 must answer 500 with
+      // FlareSolverr's error shape, never a 400, because that is the signal its clients read.
+      const target = validateTarget(req.url, req.session);
+      if (isTargetError(target)) return fail(deps, startTimestamp, target.message);
 
       const requested =
         typeof req.maxTimeout === 'number' && Number.isFinite(req.maxTimeout) && req.maxTimeout > 0
           ? req.maxTimeout
           : DEFAULT_MAX_TIMEOUT;
       const maxTimeout = Math.min(requested, MAX_MAX_TIMEOUT);
-      const session = suppliedSession || sessionFor(url);
       const postData = cmd === 'request.post' && typeof req.postData === 'string' ? req.postData : undefined;
 
       try {
-        // Forward the PARSED href, not the raw string. The allow-list decision was made on
-        // `parsed`, so handing the browser anything else leaves a gap between what we
-        // inspected and what gets fetched. Node and Chromium both implement WHATWG parsing,
-        // so no divergence is known — this closes the class rather than a specific case.
-        const solution = await deps.solve({ cmd, url: parsed.href, session, maxTimeout, postData });
+        // `target.url` is the PARSED href, not the raw string. The allow-list decision was
+        // made on the parse, so handing the browser anything else leaves a gap between what
+        // we inspected and what gets fetched. Node and Chromium both implement WHATWG
+        // parsing, so no divergence is known — this closes the class rather than a case.
+        const solution = await deps.solve({ cmd, url: target.url, session: target.session, maxTimeout, postData });
         return ok(deps, startTimestamp, { solution });
       } catch (e: unknown) {
         return fail(deps, startTimestamp, e instanceof Error ? e.message : String(e));

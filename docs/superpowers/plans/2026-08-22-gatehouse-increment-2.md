@@ -259,7 +259,7 @@ Create `test/unit/store.test.ts`:
 
 ```ts
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DownloadStore } from '../../src/downloads/store.js';
@@ -380,13 +380,51 @@ describe('DownloadStore', () => {
     expect(s.get(a.id)?.lastAccessAt).toBe(7777);
   });
 
-  it('writes the manifest atomically, leaving no tmp file behind', async () => {
+  // NOTE (corrected during review): the test below does NOT test atomicity — it survives a
+  // mutant that writes in place with no tmp and no rename. Keep it under this honest name,
+  // and pin atomicity separately with `stat().ino`: a rename swaps in a different file
+  // object, an in-place write keeps the same one. No mocking required.
+  it('writes a manifest that parses and leaves no tmp behind', async () => {
     const s = mk(); await s.load();
     await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
     const files = await readdir(dir);
     expect(files).toContain('manifest.json');
     expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
     JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')); // must parse
+  });
+
+  it('writes the manifest atomically', async () => {
+    const s = mk(); await s.load();
+    await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
+
+    const p = join(dir, 'manifest.json');
+    const before = await stat(p);
+    await s.create({ url: 'http://x.test/b', session: 'x.test', referer: null });
+    const after = await stat(p);
+
+    // A rename swaps in a different file object; an in-place write would keep the same one.
+    expect(after.ino).not.toBe(before.ino);
+  });
+
+  it('demotes a running record to failed on restart', async () => {
+    const s = mk(); await s.load();
+    const a = await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
+    await s.update(a.id, { state: 'running', received: 40 });
+
+    // The process that owned that transfer is gone. A stale `running` record would wedge its
+    // session+url pair forever, because findOpen would keep deduping onto a job nothing runs.
+    const s2 = mk(); await s2.load();
+    const back = s2.get(a.id)!;
+    expect(back.state).toBe('failed');
+    expect(back.error?.code).toBe('cancelled');
+    expect(back.completedAt).not.toBeNull(); // or its TTL would run from when it STARTED
+    expect(s2.findOpen('x.test', 'http://x.test/a')).toBeUndefined();
+  });
+
+  it('refuses a path-unsafe id', () => {
+    const s = mk();
+    expect(() => s.filePath('../../x')).toThrow();
+    expect(() => s.partPath('..')).toThrow();
   });
 });
 ```
@@ -866,6 +904,57 @@ export async function serveFile(
   await pipeline(createReadStream(opts.path, { start, end }), res);
 }
 ```
+
+> **Amended during Task 3 review — the `serveFile` above kills the daemon.**
+>
+> `await pipeline(createReadStream(...), res)` rejects with `ERR_STREAM_PREMATURE_CLOSE`
+> whenever a client goes away mid-download — user cancels, closes the tab, a media player
+> seeks and abandons, a proxy times out. For a download gateway that is the most ordinary
+> event there is, and unhandled it is `exit=1` every time. Reproduced on Node v24.14.0.
+>
+> A second reproduction: when the file is missing, `createReadStream` fails **after**
+> `writeHead` already sent `200, content-length: N` — the client gets a truncated 200 AND the
+> process dies.
+>
+> Required, all inside `serveFile` (it lives in this task's own file, so there is no reason to
+> defer it to a call site):
+>
+> - **Open the stream BEFORE writing headers.** Wait for its `open` event or its first error.
+>   An error at that point means nothing has been sent, so answer 500 honestly instead of a
+>   truncated 200.
+> - **Contain the streaming rejection.** Headers are already out by then, so there is no in-band
+>   way to signal failure: destroy the response socket and return normally. Log at **warn** —
+>   a client hang-up is routine and must not read as an error.
+> - **Validate `contentType`** before it reaches a header. It comes from the same untrusted
+>   upstream response as the filename this module already encodes; a CRLF in it makes
+>   `writeHead` throw. Anything not matching a conservative media-type pattern falls back to
+>   `application/octet-stream`.
+> - **Set `content-length: 0` on the 416**, or it goes out chunked.
+>
+> **Second amendment — hand-rolled header sanitising was wrong twice; use Node's own predicate.**
+> A blacklist of `\r\n\0` still let 30 characters through that Node rejects: every C0 control
+> except HT/LF/CR/NUL, `\x7f`, and **every non-Latin-1 codepoint**. `content-type:
+> "application/zip; name=€.zip"` from an upstream server was `exit 1`. Likewise
+> `encodeURIComponent` throws `URIError` on a lone surrogate in a filename — same class, same
+> dead daemon.
+>
+> Run **every** outgoing header value through `validateHeaderValue` (from `node:http`) in a
+> try/catch immediately before `writeHead`, substituting a safe fallback and logging at warn.
+> That makes it impossible for any header value from any source to throw inside `writeHead`,
+> which is the property wanted — not a character list that has to be kept correct.
+>
+> Also: `pipeline` rejects `ERR_STREAM_UNABLE_TO_PIPE` **before** taking ownership of its
+> source, so a client abort landing while `fs.open` is in flight leaks the read stream unless
+> the catch destroys it explicitly. Measured at 116 leaked descriptors per 200 aborts.
+>
+> And distinguish `ERR_STREAM_PREMATURE_CLOSE` (a real client hang-up → warn) from every other
+> stream failure (→ error). Otherwise an EISDIR or a revoked permission logs as a routine
+> cancel, which is exactly the line someone will trust at 3am.
+
+> Test note: the injection test must assert the **encoded form** (`toContain('%0D%0A')`), not
+> read headers back through an HTTP parser that could never surface a smuggled header anyway.
+> The original assertions passed against a mutant that stripped CR/LF instead of encoding it,
+> and went red only via Node's internal validator plus a 60-second timeout.
 
 - [ ] **Step 4: Run it and confirm it passes**
 

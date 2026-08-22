@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { timingSafeEqual } from 'node:crypto';
 import { ConfigError, isLoopback, type GatehouseConfig } from '../config.js';
 import { fail, handleV1, type V1Deps } from './v1.js';
+import { handleGh, type GhDeps } from './gh.js';
 import { log } from '../log.js';
 
 export class PortInUseError extends Error {}
@@ -99,7 +100,17 @@ function boundToLoopback(address: string): boolean {
   return addr === '::1' || /^127\./.test(addr);
 }
 
-export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: () => object): Promise<ServerHandle> {
+export async function startServer(
+  cfg: GatehouseConfig,
+  deps: V1Deps,
+  health: () => object,
+  /**
+   * Optional so the download surface is mounted only when a store was actually wired in.
+   * Increment 1's callers pass nothing and keep getting this router's own 404 for `/gh/*`
+   * paths, rather than a half-built surface that 500s.
+   */
+  gh?: GhDeps,
+): Promise<ServerHandle> {
   // Seeded from the configured name, then replaced below with the verdict on the address that
   // was actually bound. Nothing can be served before `listen` resolves, so the seed value is
   // never the one a request is judged against.
@@ -166,6 +177,14 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
           send(res, httpStatus, body);
           return;
         }
+
+        // AWAITED, and inside the try/catch above on purpose. `handleGh` reaches
+        // `store.filePath` (which throws on an id a corrupt manifest could hold) and
+        // `store.remove` (which can fail on a file another process has locked). `void`ing this
+        // would turn either into an unhandled rejection, and an unhandled rejection in a daemon
+        // is `exit 1`. Returning false means the path is not ours, so we fall through to the
+        // 404 below.
+        if (gh && (await handleGh(req, res, path, gh))) return;
 
         send(res, 404, { status: 'error', message: `no such path: ${path}` });
       } catch (e: unknown) {
