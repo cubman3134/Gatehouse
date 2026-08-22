@@ -535,9 +535,15 @@ export interface PageSnapshot {
 export type Verdict = 'clear' | 'challenged' | 'interactive' | 'blocked';
 
 /** Cloudflare's terminal codes. Retrying these makes a soft block permanent. */
-const BLOCK_MARKERS = ['error code: 1020', 'error 1020', 'error code: 1015', 'error 1015'];
-const INTERACTIVE_MARKERS = ['cf-turnstile', 'data-sitekey'];
-const CHALLENGE_MARKERS = ['challenge-form', 'challenge-platform', 'cf_chl_opt', 'just a moment'];
+const BLOCK_MARKERS = ['error code: 1020', 'error 1020', 'error code: 1015', 'error 1015'] as const;
+// Cloudflare-owned only. `data-sitekey` was REJECTED: it is reCAPTCHA's and hCaptcha's
+// attribute, so a page that HAS cleared Cloudflare but carries a third-party captcha on a
+// login form would be read as an unsolvable challenge and the poll loop would never finish.
+const INTERACTIVE_MARKERS = ['cf-turnstile', 'challenges.cloudflare.com/turnstile'] as const;
+// `just a moment` was REJECTED as too generic — it matches ordinary copy like "Just a moment,
+// loading your cart". The markers below plus the cf-mitigated header identify the real
+// interstitial without it.
+const CHALLENGE_MARKERS = ['challenge-form', 'challenge-platform', 'cf_chl_opt'] as const;
 
 function header(headers: Record<string, string>, name: string): string | undefined {
   const want = name.toLowerCase();
@@ -563,7 +569,7 @@ export function classify(snap: PageSnapshot): Verdict {
   if (INTERACTIVE_MARKERS.some((m) => html.includes(m))) return 'interactive';
 
   const mitigated = header(snap.headers, 'cf-mitigated');
-  if (mitigated !== undefined && mitigated.toLowerCase() === 'challenge') return 'challenged';
+  if (mitigated !== undefined && mitigated.trim().toLowerCase() === 'challenge') return 'challenged';
 
   if (CHALLENGE_MARKERS.some((m) => html.includes(m))) return 'challenged';
 
