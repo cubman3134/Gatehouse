@@ -1,5 +1,5 @@
 import type { BrowserPool } from './pool.js';
-import { classify, type PageSnapshot } from './detect.js';
+import { classify, looksInteractive, type PageSnapshot } from './detect.js';
 import type { Solution, Solver, SolveRequest, SolvedCookie } from '../api/v1.js';
 import type { FailureCode } from '../jobs/queue.js';
 import { log } from '../log.js';
@@ -154,6 +154,8 @@ export function makeSolver(pool: BrowserPool): Solver {
 
         let verdict = 'challenged' as ReturnType<typeof classify>;
         let html = '';
+        // The last snapshot taken, kept for the deadline-expiry judgement below.
+        let last: PageSnapshot = { status: frame.status, headers: frame.headers, html };
 
         while (Date.now() < deadline) {
           html = (await withDeadline(
@@ -164,26 +166,31 @@ export function makeSolver(pool: BrowserPool): Solver {
             `reading ${req.url} did not complete within ${req.maxTimeout}ms`,
           ));
           const snap: PageSnapshot = { status: frame.status, headers: frame.headers, html };
+          last = snap;
           verdict = classify(snap);
 
           if (verdict === 'clear') break;
           if (verdict === 'blocked') {
             throw coded('blocked', `host returned a hard block for ${req.url}`);
           }
-          if (verdict === 'interactive') {
-            // SEAM FOR INCREMENT 3: this is where the job becomes `pending-human` and the
-            // window is shown. Until then an interactive challenge is a clean failure.
-            throw coded(
-              'challenge-failed',
-              `${req.url} needs an interactive challenge solved; not supported yet`,
-            );
-          }
+          // A Turnstile widget is NOT a reason to stop. Cloudflare's managed challenge draws
+          // one while solving itself — measured clearing ~1s after the widget appeared — so
+          // the only honest answer to "does this need a person?" comes at the deadline.
           // Never sleep past the deadline: a full interval of overrun is a full interval the
           // caller waits for an answer already known to be late.
           await sleep(Math.min(POLL_INTERVAL_MS, deadline - Date.now()));
         }
 
         if (verdict !== 'clear') {
+          if (looksInteractive(last)) {
+            // SEAM FOR INCREMENT 3: this is where the job becomes `pending-human` and the
+            // window is shown. Until then a challenge that outlived its deadline still
+            // holding a Turnstile widget is a clean failure.
+            throw coded(
+              'challenge-failed',
+              `${req.url} did not clear within ${req.maxTimeout}ms and still shows an interactive challenge; a person may be required, which is not supported yet`,
+            );
+          }
           throw coded('challenge-failed', `challenge did not clear within ${req.maxTimeout}ms for ${req.url}`);
         }
 
