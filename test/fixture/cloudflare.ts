@@ -61,13 +61,14 @@ export async function startCloudflareFixture(opts: FixtureOptions = {}): Promise
   const secret = randomUUID();
   const paths: string[] = [];
 
+  let closed = false;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const path = (req.url ?? '/').split('?')[0] ?? '/';
     paths.push(path);
 
-    // The verify hop mints the clearance cookie. Only a client that executed the
-    // interstitial's script ever reaches it in 'js' mode; 'interactive' never links here.
-    if (path === '/cdn-cgi/verify') {
+    // The verify endpoint only exists in 'js' mode and mints the clearance cookie
+    // when reached. In 'interactive' mode, the endpoint does not exist.
+    if (path === '/cdn-cgi/verify' && mode === 'js') {
       res.writeHead(302, {
         'set-cookie': `cf_clearance=${secret}; Path=/; HttpOnly`,
         location: '/',
@@ -90,15 +91,25 @@ export async function startCloudflareFixture(opts: FixtureOptions = {}): Promise
     res.end(mode === 'js' ? jsInterstitial() : interactiveInterstitial());
   });
 
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
   const { port } = server.address() as AddressInfo;
 
   return {
     url: `http://127.0.0.1:${port}`,
     secret,
     paths,
-    close: () => new Promise<void>((resolve, reject) =>
-      server.close((err) => (err ? reject(err) : resolve())),
-    ),
+    close: () => new Promise<void>((resolve) => {
+      if (closed) {
+        resolve();
+        return;
+      }
+      server.close(() => {
+        closed = true;
+        resolve();
+      });
+    }),
   };
 }

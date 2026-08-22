@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { startCloudflareFixture, PAYLOAD_MARKER, type Fixture } from '../fixture/cloudflare.js';
+import { startCloudflareFixture, PAYLOAD_MARKER, CHALLENGE_TITLE, type Fixture } from '../fixture/cloudflare.js';
 
 let fx: Fixture | undefined;
 afterEach(async () => { await fx?.close(); fx = undefined; });
@@ -16,6 +16,8 @@ describe('fake Cloudflare fixture', () => {
     expect(res.headers.get('cf-mitigated')).toBe('challenge');
     expect(body).not.toContain(PAYLOAD_MARKER);
     expect(body).toContain('challenge-form');
+    expect(body).toContain(CHALLENGE_TITLE);
+    expect(body).toContain('/cdn-cgi/verify');
   });
 
   it('serves the payload once the clearance cookie is presented', async () => {
@@ -48,6 +50,21 @@ describe('fake Cloudflare fixture', () => {
 
     expect(body).toContain('cf-turnstile');
     expect(body).not.toContain('/cdn-cgi/verify');
+  });
+
+  it('interactive mode will not mint a cookie even on a direct verify hit', async () => {
+    fx = await startCloudflareFixture({ mode: 'interactive' });
+    const res = await fetch(new URL('/cdn-cgi/verify', fx.url), { redirect: 'manual' });
+    expect(res.status).toBe(503);
+    expect(res.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('picks the right cookie among decoys and keeps a value containing "="', async () => {
+    fx = await startCloudflareFixture();
+    const res = await fetch(fx.url, {
+      headers: { cookie: `other=a=b; xcf_clearance=nope; cf_clearance=${fx.secret}` },
+    });
+    expect(res.status).toBe(200);
   });
 
   it('records the paths it was asked for', async () => {
