@@ -15,7 +15,7 @@ const version = (createRequire(import.meta.url)('../package.json') as { version:
 // window closes.
 app.on('window-all-closed', () => { /* keep running */ });
 
-void app.whenReady().then(async () => {
+async function start(): Promise<void> {
   const cfg = loadConfig(process.env);
   const pool = new BrowserPool();
   const solve = makeSolver(pool);
@@ -29,7 +29,14 @@ void app.whenReady().then(async () => {
 
   const deps: V1Deps = {
     // Every /v1 solve goes through the queue, so concurrency and dedupe apply to it too.
-    solve: async (req) => {
+    solve: async (incoming) => {
+      // The ceiling in /v1 is the client's; this one is the operator's. The deadline the
+      // solver enforces is `maxTimeout`, so clamping here is the only thing that makes
+      // GATEHOUSE_SOLVE_TIMEOUT_MS mean anything — unclamped it is a knob wired to nothing.
+      const req: SolveRequest = {
+        ...incoming,
+        maxTimeout: Math.min(incoming.maxTimeout, cfg.solveTimeoutMs),
+      };
       // NUL-separated: NUL cannot occur in a session name, a URL, or form-encoded post data,
       // so no two distinct requests can collide onto one dedupe key.
       const job = queue.submit(`${req.session}\u0000${req.url}\u0000${req.postData ?? ''}`, req);
@@ -48,11 +55,18 @@ void app.whenReady().then(async () => {
     queue: { depth: queue.depth },
   });
 
+  const server = await startServer(cfg, deps, health);
+  // The integration harness waits for this exact line.
+  process.stdout.write(`GATEHOUSE_READY http://${cfg.bind}:${server.port}\n`);
+  app.on('before-quit', () => { pool.destroy(); void server.close(); });
+}
+
+// Startup runs entirely inside the guard. loadConfig, the pool and the solver used to sit
+// outside it, so a ConfigError — the sentence telling an operator to set GATEHOUSE_TOKEN —
+// surfaced as a raw unhandled rejection instead of a logged message and a clean exit.
+void app.whenReady().then(async () => {
   try {
-    const server = await startServer(cfg, deps, health);
-    // The integration harness waits for this exact line.
-    process.stdout.write(`GATEHOUSE_READY http://${cfg.bind}:${server.port}\n`);
-    app.on('before-quit', () => { pool.destroy(); void server.close(); });
+    await start();
   } catch (e: unknown) {
     log.error(e instanceof Error ? e.message : String(e));
     app.exit(1);

@@ -5,7 +5,7 @@
   "private": true,
   "main": "dist/main.js",
   "scripts": {
-    "test": "vitest run",
+    "test": "tsc && vitest run",
     "build": "tsc",
     "start": "electron ."
   },

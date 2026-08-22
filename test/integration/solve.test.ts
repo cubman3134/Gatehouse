@@ -1,6 +1,38 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import type { Socket } from 'node:net';
 import { startGatehouse, type Harness } from './harness.js';
 import { startCloudflareFixture, PAYLOAD_MARKER, type Fixture } from '../fixture/cloudflare.js';
+
+/**
+ * A server that completes the TCP handshake, reads the request, and then never answers —
+ * the shape that makes an unbounded navigation hang forever. Sockets are tracked so the
+ * close can destroy them; `server.close()` alone waits for connections that never end.
+ */
+async function startStallingServer(): Promise<{ url: string; close(): Promise<void> }> {
+  const sockets = new Set<Socket>();
+  const server = createServer(() => { /* deliberately never responds */ });
+  server.on('connection', (s: Socket) => {
+    sockets.add(s);
+    s.once('close', () => sockets.delete(s));
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = server.address() as AddressInfo;
+
+  return {
+    url: `http://127.0.0.1:${port}`,
+    close: () => new Promise<void>((resolve) => {
+      for (const s of sockets) s.destroy();
+      sockets.clear();
+      server.close(() => resolve());
+    }),
+  };
+}
 
 let gh: Harness;
 beforeAll(async () => { gh = await startGatehouse(); }, 60_000);
@@ -38,12 +70,16 @@ describe('the real app against the fake Cloudflare', () => {
   }, 60_000);
 
   it('reuses the cleared partition on a second request to the same session', async () => {
-    const before = fx.paths.filter((p) => p === '/cdn-cgi/verify').length;
+    const beforeVerifies = fx.paths.filter((p) => p === '/cdn-cgi/verify').length;
+    const beforeRequests = fx.paths.length;
     const { json } = await v1({ cmd: 'request.get', url: fx.url + '/', maxTimeout: 70000 });
 
     expect(json.solution.response).toContain(PAYLOAD_MARKER);
-    // The partition already holds the clearance, so no second verify hop was needed.
-    expect(fx.paths.filter((p) => p === '/cdn-cgi/verify').length).toBe(before);
+    // A Chromium cache hit would also leave the verify count alone while never sending the
+    // cookie at all, so the fixture must show it was actually asked — and asked without
+    // being sent back through the challenge.
+    expect(fx.paths.length).toBeGreaterThan(beforeRequests);
+    expect(fx.paths.filter((p) => p === '/cdn-cgi/verify').length).toBe(beforeVerifies);
   }, 60_000);
 
   it('fails cleanly on an interactive challenge instead of hanging', async () => {
@@ -63,4 +99,67 @@ describe('the real app against the fake Cloudflare', () => {
     expect(res.status).toBe(200);
     expect((await res.json() as any).browsers).toBeDefined();
   });
+
+  /**
+   * Two concurrent solves on ONE session name. The pool only reuses a window that is idle,
+   * so this builds a second BrowserWindow on the same `persist:` partition — and a partition
+   * is one Electron Session, whose `onHeadersReceived` is a single slot. A per-solve
+   * registration therefore evicts its neighbour's, and the evicted solve sees `status: 0`
+   * and no headers for its whole run: no `cf-mitigated`, no challenge signal from the
+   * headers, and an interstitial one marker away from being judged `clear` and handed back
+   * as content. Shipped defaults reach this: concurrency is 2 and /v1 derives the session
+   * from the hostname, so two paths on one host are two concurrent jobs on one session.
+   */
+  it('keeps both solves intact when two run concurrently on one session', async () => {
+    const two = await startCloudflareFixture();
+    try {
+      const get = (path: string) =>
+        v1({ cmd: 'request.get', url: two.url + path, session: 'concurrent', maxTimeout: 30000 });
+
+      const [a, b] = await Promise.all([get('/alpha'), get('/beta')]);
+
+      for (const r of [a, b]) {
+        expect(r.status).toBe(200);
+        expect(r.json.status).toBe('ok');
+        expect(r.json.solution.response).toContain(PAYLOAD_MARKER);
+        // The captured main-frame status and headers are per-solve state. A shared listener
+        // leaves one of the two at its initializer.
+        expect(r.json.solution.status).toBe(200);
+        expect(Object.keys(r.json.solution.headers).length).toBeGreaterThan(0);
+        const clearance = r.json.solution.cookies.find((c: any) => c.name === 'cf_clearance');
+        expect(clearance?.value).toBe(two.secret);
+      }
+    } finally {
+      await two.close();
+    }
+  }, 90_000);
+
+  /**
+   * maxTimeout has to bound the navigation, not just the poll loop. A host that accepts the
+   * connection and then says nothing used to hold `loadURL` open forever, pinning a pool
+   * window and a queue slot; two of them wedge the service at the default concurrency.
+   */
+  it('gives up on a host that accepts the connection and never answers', async () => {
+    const stall = await startStallingServer();
+    try {
+      const began = Date.now();
+      const { status, json } = await v1({
+        cmd: 'request.get',
+        url: stall.url + '/',
+        session: 'stalled',
+        maxTimeout: 4000,
+      });
+      const elapsed = Date.now() - began;
+
+      expect(status).toBe(500);
+      expect(json.status).toBe('error');
+      expect(json.message).toMatch(/did not complete within 4000ms/);
+      // It must actually be the deadline that ended it, not some other early failure, and it
+      // must not run long past it.
+      expect(elapsed).toBeGreaterThan(3000);
+      expect(elapsed).toBeLessThan(30_000);
+    } finally {
+      await stall.close();
+    }
+  }, 60_000);
 });
