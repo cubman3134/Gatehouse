@@ -137,7 +137,7 @@ describe('handleV1', () => {
     );
     const r = body as any;
 
-    expect(r.solution).toEqual(odd);
+    expect(r.solution).toStrictEqual(odd);
     expect(Object.keys(r)).toEqual(['status', 'message', 'startTimestamp', 'endTimestamp', 'version', 'solution']);
   });
 

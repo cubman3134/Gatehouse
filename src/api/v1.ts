@@ -179,7 +179,11 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
       const postData = cmd === 'request.post' && typeof req.postData === 'string' ? req.postData : undefined;
 
       try {
-        const solution = await deps.solve({ url, session, maxTimeout, postData });
+        // Forward the PARSED href, not the raw string. The allow-list decision was made on
+        // `parsed`, so handing the browser anything else leaves a gap between what we
+        // inspected and what gets fetched. Node and Chromium both implement WHATWG parsing,
+        // so no divergence is known — this closes the class rather than a specific case.
+        const solution = await deps.solve({ url: parsed.href, session, maxTimeout, postData });
         return ok(deps, startTimestamp, { solution });
       } catch (e: unknown) {
         return fail(deps, startTimestamp, e instanceof Error ? e.message : String(e));
