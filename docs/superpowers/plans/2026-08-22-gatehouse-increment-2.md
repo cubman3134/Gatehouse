@@ -932,9 +932,8 @@ export async function serveFile(
 > - **Set `content-length: 0` on the 416**, or it goes out chunked.
 >
 > **Second amendment — hand-rolled header sanitising was wrong twice; use Node's own predicate.**
-> A blacklist of `
- ` still let 30 characters through that Node rejects: every C0 control
-> except HT/LF/CR/NUL, ``, and **every non-Latin-1 codepoint**. `content-type:
+> A blacklist of `\r\n\0` still let 30 characters through that Node rejects: every C0 control
+> except HT/LF/CR/NUL, `\x7f`, and **every non-Latin-1 codepoint**. `content-type:
 > "application/zip; name=€.zip"` from an upstream server was `exit 1`. Likewise
 > `encodeURIComponent` throws `URIError` on a lone surrogate in a filename — same class, same
 > dead daemon.

@@ -209,7 +209,18 @@ export async function serveFile(
     return;
   }
 
-  res.writeHead(range ? 206 : 200, vetHeaders(headers));
+  // The stream is open, so ANY throw from here leaks a descriptor and escapes into a `void
+  // serveFile(...)` call site. `vetHeaders` guarantees the VALUES are sendable, but writeHead
+  // also validates header NAMES, and this module's thesis is not to depend on a list staying
+  // correct — including the list of names a future contributor might make dynamic.
+  try {
+    res.writeHead(range ? 206 : 200, vetHeaders(headers));
+  } catch (err) {
+    body.destroy();
+    res.destroy();
+    log.error('could not send response headers', { path: opts.path, reason: String(err) });
+    return;
+  }
 
   try {
     await pipeline(body, res);

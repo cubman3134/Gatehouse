@@ -226,6 +226,9 @@ describe('serveFile', () => {
     expect(res!.status).toBe(200);
     const cd = res!.headers.get('content-disposition') ?? '';
     expect(cd).toContain('attachment');
+    // Pin the REPLACEMENT, not merely that something was served: giving up entirely and
+    // emitting a bare `attachment` would satisfy every other assertion here.
+    expect(cd).toContain("filename*=UTF-8''bad%EF%BF%BDname.zip");
     expect(cd).not.toMatch(/[\r\n]/);
     expect(await res!.text()).toBe('0123456789');
   });
