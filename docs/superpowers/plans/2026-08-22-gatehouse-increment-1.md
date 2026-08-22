@@ -10,8 +10,9 @@
 
 ## Global Constraints
 
-- **Node** >= 20.
-- **Electron** >= 30. Install with `npm i -D electron@latest` and record the resolved version in `package.json` as an exact pin (no `^`).
+- **Node** >= 22.12.0. (Corrected during Task 1: the plan originally said >= 20, but Electron 43 declares `engines: node >= 22.12.0`. Reality wins; `package.json` records the real floor.)
+- **Electron** >= 30. Install with `npm i -D electron@latest` and record the resolved version in `package.json` as an exact pin (no `^`). Pinned at **43.4.1**. Note Electron 43 has no `postinstall`, so `npm ci` alone does NOT fetch the ~235MB binary.
+- **TypeScript module resolution is `nodenext`**, not `bundler`. (Corrected during Task 1.) `bundler` typechecks extensionless relative imports clean and emits ESM that Electron cannot load; `nodenext` enforces the `.js` extension at compile time. All `src/` imports carry `.js`.
 - **The `/v1` response shape is not ours to design.** It matches FlareSolverr. Any deviation breaks the increment's entire premise.
 - **Allarr's read path is the acceptance bar:** the response MUST carry a non-empty `solution.userAgent` and a `solution.cookies` entry with `name === "cf_clearance"` and a non-empty `value`. Allarr ignores every other field.
 - **Allarr sends no `Authorization` header.** Loopback binds MUST NOT require auth.
