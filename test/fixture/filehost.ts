@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 
 export interface FileHost {
   url: string;
@@ -13,9 +13,16 @@ export interface FileHostOptions {
    * 'range'    — honours Range with a 206 (the good case).
    * 'no-range' — ignores Range and always sends the whole body with a 200.
    * 'truncate' — sends half the body then destroys the socket, to force a resume.
-   * 'stall'    — sends headers and one byte, then nothing, forever.
+   * 'stall'      — sends headers and one byte, then nothing, forever.
+   * 'chunked'    — no content-length at all, body in Transfer-Encoding chunks, as a
+   *                dynamically generated or proxied download arrives.
+   * 'no-headers' — accepts the socket and sends nothing, ever: not even a status line. This is
+   *                the request phase hanging, which is a different fault from 'stall'.
+   * 'lying-206'  — answers a ranged request with 206 but a content-range of `bytes 0-n-1/n`
+   *                and the whole body, the way some proxies and CDNs do. Appending that to a
+   *                partial is exactly the silent corruption the transfer guard exists to stop.
    */
-  mode?: 'range' | 'no-range' | 'truncate' | 'stall';
+  mode?: 'range' | 'no-range' | 'truncate' | 'stall' | 'chunked' | 'no-headers' | 'lying-206';
   body?: Buffer;
   filename?: string;
 }
@@ -38,10 +45,32 @@ export async function startFileHost(opts: FileHostOptions = {}): Promise<FileHos
       'accept-ranges': 'bytes',
     };
 
+    if (mode === 'no-headers') return; // socket accepted, nothing ever written
+
     if (mode === 'stall') {
       res.writeHead(200, { ...common, 'content-length': String(body.length) });
       res.write(body.subarray(0, 1));
       return; // never ends
+    }
+
+    if (mode === 'chunked') {
+      // Omitting content-length is what makes Node frame this as chunked; two writes so the
+      // body genuinely arrives in more than one chunk.
+      res.writeHead(200, common);
+      const half = Math.ceil(body.length / 2);
+      res.write(body.subarray(0, half));
+      res.end(body.subarray(half));
+      return;
+    }
+
+    if (mode === 'lying-206') {
+      res.writeHead(206, {
+        ...common,
+        'content-range': `bytes 0-${body.length - 1}/${body.length}`,
+        'content-length': String(body.length),
+      });
+      res.end(body);
+      return;
     }
 
     let slice = body;
@@ -78,6 +107,11 @@ export async function startFileHost(opts: FileHostOptions = {}): Promise<FileHos
     res.end(slice);
   });
 
+  // `server.close` waits for every open connection to end on its own, and the modes above are
+  // built precisely not to end. Hold the sockets so close() can cut them.
+  const sockets = new Set<Socket>();
+  server.on('connection', (s: Socket) => { sockets.add(s); s.once('close', () => sockets.delete(s)); });
+
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
@@ -86,6 +120,9 @@ export async function startFileHost(opts: FileHostOptions = {}): Promise<FileHos
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/file`,
     requests,
-    close: () => new Promise<void>((r) => server.close(() => r())),
+    close: () => new Promise<void>((r) => {
+      server.close(() => r());
+      for (const s of sockets) s.destroy();
+    }),
   };
 }
