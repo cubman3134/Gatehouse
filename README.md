@@ -86,12 +86,30 @@ All configuration is environment variables; there is no config file.
 | `GATEHOUSE_TOKEN` | *(none)* | Bearer token. Mandatory for a non-loopback bind. |
 | `GATEHOUSE_CONCURRENCY` | `2` | Simultaneous browser windows, 1–16. |
 | `GATEHOUSE_SOLVE_TIMEOUT_MS` | `70000` | Server-side ceiling on one solve, 1000–600000 — but see below: anything above 300000 is inert. |
-| `GATEHOUSE_DOWNLOADS_DIR` | *(Electron's `userData/downloads`)* | Absolute directory the downloaded files live in. Empty means "derive it", which is why the default is not a fixed path. |
+| `GATEHOUSE_DOWNLOADS_DIR` | *(Electron's `userData/downloads`)* | Directory the downloaded files live in. **Must be absolute** — a relative value is refused at startup, not resolved. Empty means "derive it", which is why the default is not a fixed path. |
 | `GATEHOUSE_DOWNLOAD_CONCURRENCY` | `2` | Simultaneous transfers, 1–16. Separate from `GATEHOUSE_CONCURRENCY`: a download holds no browser window. |
 | `GATEHOUSE_DOWNLOAD_TTL_MS` | `86400000` (24h) | How long a **completed** download's bytes survive without a `DELETE`, 60000–2592000000. |
 | `GATEHOUSE_DOWNLOAD_MAX_BYTES` | `53687091200` (50 GiB) | Cap on the downloads directory, 1048576–9007199254740991. Least-recently-served completed files evict first. |
+| `GATEHOUSE_DOWNLOAD_STALL_MS` | `120000` (2m) | How long one transfer may go with **no progress at all** before it is aborted, 5000–3600000. An idle window, not a time limit on the download. |
 
-A bad value is a startup failure with the range in the message, not a silent fallback.
+A bad value is a startup failure with the range in the message, not a silent fallback. That
+includes a relative `GATEHOUSE_DOWNLOADS_DIR`: it would be resolved against whatever directory
+`electron .` happened to be launched from, which is a different place after a restart from
+another shell, and the `path` handed back on a completed download — documented below as a path
+you give to another process — would be a meaningless relative string. Two readings of a
+relative value are plausible and we are not told which you meant, so it is refused rather than
+guessed at.
+
+**`GATEHOUSE_DOWNLOAD_STALL_MS` is an idle timer, not a deadline.** A multi-GB download is
+allowed to take hours; what it may not do is sit for two minutes with the received-byte count
+not moving. This exists because a host that accepts the socket and then writes nothing produces
+no response and no error, so nothing in the transfer ever fires — it would hold one of
+`GATEHOUSE_DOWNLOAD_CONCURRENCY` slots until the process restarted, and two such hosts would
+wedge the whole download surface while `/gh/fetch` kept answering 202 to work that never ran.
+Progress is persisted every 4 MB, so the window has to stay comfortably above the time to move
+4 MB on the slowest link you care about; the floor of 5000 is there to stop it being tightened
+into killing healthy-but-slow transfers. An aborted transfer settles `cancelled` — see
+`DELETE /gh/jobs/:id` below for why it reads as a caller cancel.
 
 **Auth.** A loopback bind takes no auth, because FlareSolverr clients send no
 `Authorization` header and requiring one would break drop-in compatibility on day one.
@@ -208,11 +226,39 @@ running it requests a **cancel**, which is asynchronous: the transfer notices, c
 stream, deletes its partial and only then marks the record `cancelled`. Poll until the state
 settles if you need to know it landed.
 
+That asynchrony has a wrinkle worth knowing: the `204` says the cancel was *requested*, not
+that it landed. A job still `queued` — nothing running yet, so nothing to interrupt — answers
+`204` and then stays unsettled until the queue reaches it and the transfer settles it
+`cancelled`, which is a slot away rather than instant. During that window `GET /gh/jobs/:id`
+still reports `queued` or `running`, and the record is still open, so a `POST /gh/fetch` for
+the same target dedupes onto the job you just cancelled. If you mean to start over, wait for
+the state to settle first.
+
+A `cancelled` record does not tell you *who* cancelled it: an idle transfer aborted by
+`GATEHOUSE_DOWNLOAD_STALL_MS` settles with exactly the same state and the same
+`cancelled by the caller` message as one you cancelled yourself. The transfer is handed an
+abort signal and cannot see where it came from, and inventing a second terminal state written
+from somewhere else would break the rule that exactly one place settles a record. The
+distinction is in the log, not on the wire.
+
 ### `GET /gh/files/:id`
 
 The bytes, with `Accept-Ranges: bytes` and full `Range` support (`206`, `Content-Range`, `416`
 for an unsatisfiable range). `HEAD` works. `409` while the job is not `done`; `404` for an
 unknown id, and also for a `done` job whose bytes are no longer on disk.
+
+**One response on this route does not use the `/gh/*` error envelope.** If the file cannot be
+opened once the response has already been committed — it was removed or locked between the
+`stat` and the read — the answer is a `500` whose body is:
+
+```json
+{ "error": "file unavailable" }
+```
+
+`error` is a **string** there, not the `{code, message}` object documented below. It is a known
+inconsistency, not a second contract to code against: by that point the status line is on the
+wire and the body is a best-effort explanation. Parse `error` defensively on this route — check
+whether it is an object before reaching for `error.code`.
 
 ### Errors here are not `/v1` errors
 
@@ -229,6 +275,27 @@ POST with a `500` carrying FlareSolverr's `{"status":"error","message":…}`, be
 the shape existing FlareSolverr clients already degrade on and it is not ours to redesign.
 `/gh/*` has no such legacy: it is a new surface with new clients, so it uses ordinary status
 codes and a machine-readable `code`. Two different contracts, on purpose — do not "unify" them.
+
+### Interrupted downloads resume on the next start
+
+Kill the app mid-transfer and the bytes already on disk are not thrown away. On the way up,
+before anything is served, Gatehouse re-queues every download the previous process was still
+running **that still has its partial file**, under its *original* job id, and the transfer picks
+up where it left off with a `Range` request. A consumer that was polling `/gh/jobs/<id>` before
+the restart keeps polling the same URL and sees the job resume, instead of a `failed` it has no
+way to retry against.
+
+Only genuinely interrupted downloads come back. One that failed for a real reason — a `404`, a
+`206` from an offset we did not ask for, a full disk — stays `failed`, because retrying it on
+every start would just hit the same wall every time. One whose partial is gone stays `failed`
+too: there is nothing to resume from, and re-fetching it from zero is the caller's call to make,
+not ours. Re-queued records are unsettled again *before* the retention sweep runs, so a partial
+that outlived `GATEHOUSE_DOWNLOAD_TTL_MS` while the daemon was down is resumed rather than
+reclaimed out from under the transfer.
+
+If the server ignores the `Range` — a `200`, or a `206` starting somewhere other than where we
+asked — the partial is discarded and the download restarts from zero rather than being silently
+corrupted. Resuming is an optimisation; correctness is not negotiated for it.
 
 ### Retention will delete your file
 
@@ -252,6 +319,13 @@ answer chunked. That fixture proves the *mechanism* — resume, cancel, dedupe, 
 serving, and the refusal to append a body the server did not actually send from the offset we
 asked for. It cannot prove behaviour at 4GB, on a slow or flaky link, or against a host that
 is actually trying to tell a browser from a script.
+
+The restart-resume path above is covered in two pieces rather than one: the *decision* about
+what to re-queue is unit-tested against a hand-built manifest, and the `Range` request and the
+refusal to append a body the server did not send from our offset are unit-tested against the
+fixture. A real kill-the-app-mid-body-and-restart run was done by hand and did resume under the
+same job id from the surviving partial — but by hand, against the local fixture, so it says
+nothing about a host's willingness to honour a `Range` hours later.
 
 Two specifics worth knowing before you rely on it. Hashing is a **second pass** over the
 finished file rather than a streaming digest, so a large download is read from disk twice

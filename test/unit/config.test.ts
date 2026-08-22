@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { loadConfig, isLoopback, ConfigError } from '../../src/config.js';
 
+/**
+ * An absolute path that is absolute on THIS platform. `D:/gh` is absolute on Windows and
+ * relative on POSIX, so hard-coding either spelling makes the downloads-dir tests assert the
+ * opposite of what they mean on the other one.
+ */
+const ABS = process.platform === 'win32' ? 'D:\\gh' : '/srv/gh';
+
 describe('loadConfig', () => {
   it('defaults to loopback on FlareSolverr port with no token', () => {
     const c = loadConfig({});
@@ -68,6 +75,7 @@ describe('loadConfig', () => {
   it('defaults the download settings', () => {
     const c = loadConfig({});
     expect(c.downloadConcurrency).toBe(2);
+    expect(c.downloadStallMs).toBe(120_000);
     expect(c.downloadTtlMs).toBe(86_400_000);
     expect(c.downloadMaxBytes).toBe(50 * 1024 * 1024 * 1024);
     expect(c.downloadsDir).toBe('');
@@ -75,15 +83,53 @@ describe('loadConfig', () => {
 
   it('accepts explicit download settings', () => {
     const c = loadConfig({
-      GATEHOUSE_DOWNLOADS_DIR: 'D:/gh',
+      GATEHOUSE_DOWNLOADS_DIR: ABS,
       GATEHOUSE_DOWNLOAD_CONCURRENCY: '5',
       GATEHOUSE_DOWNLOAD_TTL_MS: '3600000',
       GATEHOUSE_DOWNLOAD_MAX_BYTES: '1073741824',
+      GATEHOUSE_DOWNLOAD_STALL_MS: '30000',
     });
-    expect(c.downloadsDir).toBe('D:/gh');
+    expect(c.downloadsDir).toBe(ABS);
     expect(c.downloadConcurrency).toBe(5);
     expect(c.downloadTtlMs).toBe(3_600_000);
     expect(c.downloadMaxBytes).toBe(1_073_741_824);
+    expect(c.downloadStallMs).toBe(30_000);
+  });
+
+  // A relative value would be resolved against whatever directory `electron .` was launched
+  // from -- a different one after a restart from another shell -- and `result.path`, which is
+  // documented as a path a consumer hands to another process, would be a meaningless relative
+  // string. Refusing is better than silently picking one of two plausible readings of it.
+  it('refuses a relative downloads dir, naming the setting', () => {
+    for (const bad of ['downloads', './downloads', '../shared/dl', 'a/b/c']) {
+      expect(() => loadConfig({ GATEHOUSE_DOWNLOADS_DIR: bad })).toThrow(ConfigError);
+      expect(() => loadConfig({ GATEHOUSE_DOWNLOADS_DIR: bad })).toThrow(/GATEHOUSE_DOWNLOADS_DIR/);
+      expect(() => loadConfig({ GATEHOUSE_DOWNLOADS_DIR: bad })).toThrow(/absolute/i);
+    }
+  });
+
+  it('still accepts an absolute downloads dir, and blank still means derive it', () => {
+    expect(loadConfig({ GATEHOUSE_DOWNLOADS_DIR: ABS }).downloadsDir).toBe(ABS);
+    // Blank is not "relative", it is "unset" -- the derived default needs Electron and so
+    // cannot be computed by a pure function over the environment.
+    expect(loadConfig({ GATEHOUSE_DOWNLOADS_DIR: '   ' }).downloadsDir).toBe('');
+    expect(loadConfig({}).downloadsDir).toBe('');
+  });
+
+  // Surrounding whitespace is trimmed before the check, so a value that is absolute once
+  // trimmed must be accepted -- and one that is not must still be refused after trimming.
+  it('applies the absolute check to the trimmed value', () => {
+    expect(loadConfig({ GATEHOUSE_DOWNLOADS_DIR: `  ${ABS}  ` }).downloadsDir).toBe(ABS);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOADS_DIR: '  downloads  ' })).toThrow(ConfigError);
+  });
+
+  it('defaults the stall window to 120s and holds it to [5000, 3600000]', () => {
+    expect(loadConfig({}).downloadStallMs).toBe(120_000);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_STALL_MS: '4999' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_STALL_MS: '3600001' })).toThrow(ConfigError);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_STALL_MS: '5000' }).downloadStallMs).toBe(5_000);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_STALL_MS: '3600000' }).downloadStallMs).toBe(3_600_000);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_STALL_MS: 'soon' })).toThrow(ConfigError);
   });
 
   // Rejection alone does not catch an off-by-one in the comparison; the boundary values

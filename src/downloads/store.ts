@@ -27,6 +27,15 @@ const MANIFEST = 'manifest.json';
 const ID = /^[A-Za-z0-9_-]+$/;
 
 /**
+ * The exact message `load` stamps on a record it demoted because the process that owned it
+ * died. It is exported because it is the ONLY thing that distinguishes "interrupted, and worth
+ * resuming" from "failed for a real reason a retry will just hit again" — a 404, a refused
+ * 206. `main.ts` matches on it to decide what to re-queue on the way up, and a literal copied
+ * into that decision would drift away from this one silently.
+ */
+export const INTERRUPTED_BY_RESTART = 'interrupted by a restart';
+
+/**
  * Durable home for download records. The queue that schedules a transfer is ephemeral and its
  * jobs are pruned on settle; THIS is what `/gh/jobs/:id` reads, which is why a caller can poll
  * — and fetch the bytes — long after the transfer finished.
@@ -76,7 +85,7 @@ export class DownloadStore {
         if (r && typeof r.id === 'string') {
           // Nothing can be mid-transfer across a restart: the process that owned it is gone.
           // Demote so a stale `running` cannot block dedupe or survive a sweep forever.
-          this.records.set(r.id, isSettled(r.state) ? r : { ...r, state: 'failed', error: { code: 'cancelled', message: 'interrupted by a restart' }, completedAt: this.opts.now() });
+          this.records.set(r.id, isSettled(r.state) ? r : { ...r, state: 'failed', error: { code: 'cancelled', message: INTERRUPTED_BY_RESTART }, completedAt: this.opts.now() });
         }
       }
     } catch (e: unknown) {

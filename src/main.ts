@@ -7,6 +7,8 @@ import { startServer } from './api/server.js';
 import type { Solution, SolveRequest, V1Deps } from './api/v1.js';
 import type { GhDeps } from './api/gh.js';
 import { DownloadStore } from './downloads/store.js';
+import { requeueInterrupted } from './downloads/resume.js';
+import { isSettled } from './downloads/record.js';
 import { transfer, type Requester, type TransferResponse } from './downloads/transfer.js';
 import { log } from './log.js';
 import { randomUUID } from 'node:crypto';
@@ -136,9 +138,6 @@ async function start(): Promise<void> {
     maxBytes: cfg.downloadMaxBytes,
   });
   await store.load();
-  // On the way up, before anything can be served: `load` demotes records the previous process
-  // left `running`, and this is what reclaims their bytes and enforces the cap across restarts.
-  await store.sweep();
 
   const aborts = new Map<string, AbortController>();
   const request = electronRequester();
@@ -153,9 +152,11 @@ async function start(): Promise<void> {
       // floor and the record would sit queued until the process restarted.
       const ac = aborts.get(id) ?? new AbortController();
       aborts.set(id, ac);
+      const stopWatchdog = watchForStall(id, ac);
       try {
         await transfer(id, store, request, ac.signal);
       } finally {
+        stopWatchdog();
         aborts.delete(id);
         // Retention is enforced after every transfer, not on a timer: the thing that grows the
         // directory is a transfer finishing, so that is when the cap needs testing.
@@ -164,18 +165,88 @@ async function start(): Promise<void> {
     },
   });
 
+  /**
+   * The idle watchdog. A host that accepts the socket and then writes NOTHING produces no
+   * response and no error, so nothing inside the transfer ever fires: it holds a concurrency
+   * slot until the process restarts, and with the default of two slots, two such hosts wedge
+   * the whole download surface while `/gh/fetch` keeps handing out 202s that never run. A
+   * caller DELETE is the only other thing that can free it, and a caller with no timeout of
+   * its own never sends one.
+   *
+   * IDLE, not total: the clock is reset by progress, so a legitimate multi-GB transfer may run
+   * for hours. It fires only when `received` has not moved for a whole window. `transfer`
+   * persists `received` every 4MB, so the window must stay comfortably larger than the time to
+   * move 4MB on a slow link -- 120s is; see the note on the range in `config.ts` before anyone
+   * tightens it.
+   *
+   * Aborting is ALL this does. The transfer's own cancel path notices the signal, closes its
+   * stream, drops the partial and only then settles the record, so the single terminal-state
+   * writer stays where it is, per the invariant in `downloads/record.ts`. One consequence
+   * worth naming: the record's message reads `cancelled by the caller`, because `transfer` is
+   * handed a signal and cannot see who pulled it. Distinguishing a stall would mean writing a
+   * terminal state from here -- a second settle site, which is precisely what that invariant
+   * forbids. The log line below is where an operator finds out which it was.
+   */
+  function watchForStall(id: string, ac: AbortController): () => void {
+    let lastReceived = store.get(id)?.received ?? 0;
+    let lastProgressAt = Date.now();
+    // A quarter of the window, so the abort lands within 1.25x of it rather than 2x. The floor
+    // stops a small configured window from turning this into a busy poll.
+    const tick = Math.max(250, Math.floor(cfg.downloadStallMs / 4));
+    const timer = setInterval(() => {
+      const rec = store.get(id);
+      // Gone, or already settled by the transfer itself: there is nothing left to abort.
+      if (!rec || isSettled(rec.state)) { clearInterval(timer); return; }
+      if (rec.received !== lastReceived) {
+        lastReceived = rec.received;
+        lastProgressAt = Date.now();
+        return;
+      }
+      if (Date.now() - lastProgressAt < cfg.downloadStallMs) return;
+      clearInterval(timer);
+      log.warn('aborting a download that made no progress within the stall window', {
+        id, received: rec.received, stallMs: cfg.downloadStallMs,
+      });
+      ac.abort();
+    }, tick);
+    // The transfer holds the process up on its own; an interval that outlived it would be a
+    // leak on a daemon that runs for weeks, and would abort a later job sharing the id.
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
+  /** The one place that hands an id to the download queue: `/gh/fetch` and the resume below. */
+  const submitDownload = (id: string): void => {
+    aborts.set(id, new AbortController());
+    // NUL-separated, the same convention the solve queue uses above -- written as an
+    // escape, not a literal control character in the source. One record id is unique on
+    // its own so this key cannot collide; the real dedupe is `store.findOpen`, which folds
+    // two requests for the same session+url onto one record before either reaches here.
+    downloads.submit(`dl\u0000${id}`, id);
+  };
+
+  // On the way up, before anything can be served, and in this order:
+  //
+  //   1. `load` has just demoted every record the previous process left unsettled to `failed`.
+  //      That is a safe default, but on its own it strands an interrupted download: `failed`
+  //      is settled, so `findOpen` will not return it, a re-POST mints a new id and a new
+  //      `.part`, and the bytes already on disk are orphaned until the TTL sweep. Nothing
+  //      re-submits it -- which would leave `transfer`'s resume path with no caller at all.
+  //      Put the ones that still have a partial back on the queue under their ORIGINAL ids, so
+  //      a consumer polling `/gh/jobs/<id>` across a restart sees it resume rather than a dead
+  //      `failed`.
+  //   2. THEN sweep, which is what reclaims the rest of the interrupted bytes and enforces the
+  //      cap across restarts. Second, not first: a re-queued record is unsettled again and the
+  //      sweep never touches an unsettled record, so this ordering is what stops the sweep
+  //      deleting a partial we are about to resume from.
+  await requeueInterrupted(store, submitDownload);
+  await store.sweep();
+
   const ghDeps: GhDeps = {
     store,
     // `submit` returns a job record; nothing here awaits it, and the queue captures a failing
     // `run` itself, so no rejection escapes into this void-ed call site.
-    submit: (id) => {
-      aborts.set(id, new AbortController());
-      // NUL-separated, the same convention the solve queue uses above -- written as an
-      // escape, not a literal control character in the source. One record id is unique on
-      // its own so this key cannot collide; the real dedupe is `store.findOpen`, which folds
-      // two requests for the same session+url onto one record before either reaches here.
-      downloads.submit(`dl\u0000${id}`, id);
-    },
+    submit: submitDownload,
     // Fire-and-forget by design. The transfer notices the abort, closes its stream, drops its
     // partial and only then marks the record cancelled — settling here would race that writer.
     cancel: (id) => { aborts.get(id)?.abort(); },
