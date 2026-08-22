@@ -86,6 +86,25 @@ describe('loadConfig', () => {
     expect(c.downloadMaxBytes).toBe(1_073_741_824);
   });
 
+  // Rejection alone does not catch an off-by-one in the comparison; the boundary values
+  // have to be asserted ACCEPTED too.
+  it('accepts the download settings at their exact boundaries', () => {
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_CONCURRENCY: '1' }).downloadConcurrency).toBe(1);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_CONCURRENCY: '16' }).downloadConcurrency).toBe(16);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_TTL_MS: '60000' }).downloadTtlMs).toBe(60_000);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_TTL_MS: '2592000000' }).downloadTtlMs).toBe(2_592_000_000);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_MAX_BYTES: '1048576' }).downloadMaxBytes).toBe(1_048_576);
+  });
+
+  it('rejects download settings just past their boundaries', () => {
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_TTL_MS: '2592000001' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_MAX_BYTES: '1048575' })).toThrow(ConfigError);
+  });
+
+  it('treats a whitespace-only downloads dir as unset', () => {
+    expect(loadConfig({ GATEHOUSE_DOWNLOADS_DIR: '   ' }).downloadsDir).toBe('');
+  });
+
   it('rejects out-of-range download settings', () => {
     expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_CONCURRENCY: '0' })).toThrow(ConfigError);
     expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_CONCURRENCY: '17' })).toThrow(ConfigError);

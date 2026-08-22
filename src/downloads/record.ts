@@ -35,6 +35,11 @@ export function isSettled(state: DownloadState): boolean {
 /**
  * May a retention sweep delete this record's bytes? Only if nothing is writing them. A
  * `failed` or `cancelled` record owns at most a stale `.part`, so it is reclaimable too.
+ *
+ * That rests on an ordering invariant every writer must honour: **a record only becomes
+ * settled once the writer has closed its file handle.** Marking `cancelled` at the moment
+ * cancellation is *requested* — the natural implementation — would let a sweep unlink a file
+ * the OS still has open for writing. Settle after the stream is closed, never before.
  */
 export function isReclaimable(rec: DownloadRecord): boolean {
   return isSettled(rec.state);
