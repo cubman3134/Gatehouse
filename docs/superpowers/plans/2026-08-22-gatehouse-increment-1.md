@@ -387,9 +387,11 @@ export async function startCloudflareFixture(opts: FixtureOptions = {}): Promise
     const path = (req.url ?? '/').split('?')[0] ?? '/';
     paths.push(path);
 
-    // The verify hop mints the clearance cookie. Only a client that executed the
-    // interstitial's script ever reaches it in 'js' mode; 'interactive' never links here.
-    if (path === '/cdn-cgi/verify') {
+    // The verify hop mints the clearance cookie, and exists ONLY in 'js' mode. Gating it on
+    // the mode rather than merely not linking to it is the point: an ungated endpoint lets a
+    // client that knows the well-known Cloudflare verify URL clear 'interactive' with no
+    // human, which would leave the pending-human branch silently untested.
+    if (path === '/cdn-cgi/verify' && mode === 'js') {
       res.writeHead(302, {
         'set-cookie': `cf_clearance=${secret}; Path=/; HttpOnly`,
         location: '/',
