@@ -64,6 +64,34 @@ describe('loadConfig', () => {
     expect(loadConfig({ GATEHOUSE_CONCURRENCY: '1' }).concurrency).toBe(1);
     expect(loadConfig({ GATEHOUSE_CONCURRENCY: '16' }).concurrency).toBe(16);
   });
+
+  it('defaults the download settings', () => {
+    const c = loadConfig({});
+    expect(c.downloadConcurrency).toBe(2);
+    expect(c.downloadTtlMs).toBe(86_400_000);
+    expect(c.downloadMaxBytes).toBe(50 * 1024 * 1024 * 1024);
+    expect(c.downloadsDir).toBe('');
+  });
+
+  it('accepts explicit download settings', () => {
+    const c = loadConfig({
+      GATEHOUSE_DOWNLOADS_DIR: 'D:/gh',
+      GATEHOUSE_DOWNLOAD_CONCURRENCY: '5',
+      GATEHOUSE_DOWNLOAD_TTL_MS: '3600000',
+      GATEHOUSE_DOWNLOAD_MAX_BYTES: '1073741824',
+    });
+    expect(c.downloadsDir).toBe('D:/gh');
+    expect(c.downloadConcurrency).toBe(5);
+    expect(c.downloadTtlMs).toBe(3_600_000);
+    expect(c.downloadMaxBytes).toBe(1_073_741_824);
+  });
+
+  it('rejects out-of-range download settings', () => {
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_CONCURRENCY: '0' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_CONCURRENCY: '17' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_TTL_MS: '999' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_MAX_BYTES: '0' })).toThrow(ConfigError);
+  });
 });
 
 describe('isLoopback', () => {

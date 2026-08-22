@@ -6,6 +6,13 @@ export interface GatehouseConfig {
   token: string | null;
   concurrency: number;
   solveTimeoutMs: number;
+  /** Absolute path for downloaded files. Empty means "derive from Electron's userData". */
+  downloadsDir: string;
+  downloadConcurrency: number;
+  /** How long a completed download's bytes survive without being released. */
+  downloadTtlMs: number;
+  /** Cap on the downloads directory; least-recently-accessed completed files evict first. */
+  downloadMaxBytes: number;
 }
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -45,5 +52,12 @@ export function loadConfig(env: Record<string, string | undefined>): GatehouseCo
     port: intFrom(env.GATEHOUSE_PORT, 8191, 'GATEHOUSE_PORT', 0, 65535),
     concurrency: intFrom(env.GATEHOUSE_CONCURRENCY, 2, 'GATEHOUSE_CONCURRENCY', 1, 16),
     solveTimeoutMs: intFrom(env.GATEHOUSE_SOLVE_TIMEOUT_MS, 70_000, 'GATEHOUSE_SOLVE_TIMEOUT_MS', 1_000, 600_000),
+    downloadsDir: env.GATEHOUSE_DOWNLOADS_DIR?.trim() || '',
+    downloadConcurrency: intFrom(env.GATEHOUSE_DOWNLOAD_CONCURRENCY, 2, 'GATEHOUSE_DOWNLOAD_CONCURRENCY', 1, 16),
+    downloadTtlMs: intFrom(env.GATEHOUSE_DOWNLOAD_TTL_MS, 86_400_000, 'GATEHOUSE_DOWNLOAD_TTL_MS', 60_000, 2_592_000_000),
+    downloadMaxBytes: intFrom(
+      env.GATEHOUSE_DOWNLOAD_MAX_BYTES, 50 * 1024 * 1024 * 1024, 'GATEHOUSE_DOWNLOAD_MAX_BYTES',
+      1024 * 1024, Number.MAX_SAFE_INTEGER,
+    ),
   };
 }
