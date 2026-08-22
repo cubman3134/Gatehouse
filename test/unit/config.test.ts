@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { loadConfig, ConfigError } from '../../src/config.js';
+import { loadConfig, isLoopback, ConfigError } from '../../src/config.js';
 
 describe('loadConfig', () => {
   it('defaults to loopback on FlareSolverr port with no token', () => {
@@ -30,6 +30,16 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ GATEHOUSE_BIND: '0.0.0.0', GATEHOUSE_TOKEN: '   ' })).toThrow(ConfigError);
   });
 
+  it('treats a blank token on a loopback bind as no token at all', () => {
+    expect(loadConfig({ GATEHOUSE_BIND: '127.0.0.1', GATEHOUSE_TOKEN: '   ' }).token).toBeNull();
+    expect(loadConfig({ GATEHOUSE_TOKEN: '' }).token).toBeNull();
+  });
+
+  it('falls back to loopback when the bind is blank', () => {
+    expect(loadConfig({ GATEHOUSE_BIND: '   ' }).bind).toBe('127.0.0.1');
+    expect(loadConfig({ GATEHOUSE_BIND: '' }).bind).toBe('127.0.0.1');
+  });
+
   it('rejects a non-numeric or out-of-range port', () => {
     expect(() => loadConfig({ GATEHOUSE_PORT: 'nope' })).toThrow(ConfigError);
     expect(() => loadConfig({ GATEHOUSE_PORT: '70000' })).toThrow(ConfigError);
@@ -37,5 +47,36 @@ describe('loadConfig', () => {
 
   it('accepts port 0 for ephemeral test binds', () => {
     expect(loadConfig({ GATEHOUSE_PORT: '0' }).port).toBe(0);
+  });
+
+  it('defaults the solve timeout to 70s and holds it to [1000, 600000]', () => {
+    expect(loadConfig({}).solveTimeoutMs).toBe(70_000);
+    expect(() => loadConfig({ GATEHOUSE_SOLVE_TIMEOUT_MS: '999' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_SOLVE_TIMEOUT_MS: '600001' })).toThrow(ConfigError);
+    expect(loadConfig({ GATEHOUSE_SOLVE_TIMEOUT_MS: '1000' }).solveTimeoutMs).toBe(1_000);
+    expect(loadConfig({ GATEHOUSE_SOLVE_TIMEOUT_MS: '600000' }).solveTimeoutMs).toBe(600_000);
+  });
+
+  it('defaults concurrency to 2 and holds it to [1, 16]', () => {
+    expect(loadConfig({}).concurrency).toBe(2);
+    expect(() => loadConfig({ GATEHOUSE_CONCURRENCY: '0' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_CONCURRENCY: '17' })).toThrow(ConfigError);
+    expect(loadConfig({ GATEHOUSE_CONCURRENCY: '1' }).concurrency).toBe(1);
+    expect(loadConfig({ GATEHOUSE_CONCURRENCY: '16' }).concurrency).toBe(16);
+  });
+});
+
+describe('isLoopback', () => {
+  it('accepts only the three exact loopback spellings', () => {
+    expect(isLoopback('127.0.0.1')).toBe(true);
+    expect(isLoopback('::1')).toBe(true);
+    expect(isLoopback('localhost')).toBe(true);
+  });
+
+  it('rejects wildcard, uppercase, near-miss and bracketed forms', () => {
+    expect(isLoopback('0.0.0.0')).toBe(false);
+    expect(isLoopback('LOCALHOST')).toBe(false);
+    expect(isLoopback('127.0.0.2')).toBe(false);
+    expect(isLoopback('[::1]')).toBe(false);
   });
 });
