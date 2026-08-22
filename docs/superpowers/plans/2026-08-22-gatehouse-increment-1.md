@@ -646,7 +646,10 @@ describe('JobQueue', () => {
 
     const job = q.submit('k1', 'alpha');
     expect(job.id).toBe('job-1');
-    expect(job.state).toBe('queued');
+    // submit() claims the slot synchronously when one is free, so 'running' is the honest
+    // reading here. (The plan originally asserted 'queued', which contradicted its own
+    // pump() — caught reviewing task 4.)
+    expect(job.state).toBe('running');
 
     const done = await q.wait(job.id);
     expect(done.state).toBe('done');
@@ -838,10 +841,15 @@ export class JobQueue<P, R> {
       const payload = this.payloads.get(id);
       if (!job || payload === undefined) continue;
 
+      // Synchronously, in this order: mark running, claim the slot, THEN start the work on a
+      // microtask. Deferring the state instead would let a worker that sets job.state in its
+      // own prologue (e.g. 'pending-human') have it clobbered a microtask later. Starting the
+      // work via Promise.resolve() means a run() that throws SYNCHRONOUSLY lands in .catch
+      // rather than escaping pump() and leaking the slot forever.
       job.state = 'running';
       this.running++;
-      void this.opts
-        .run(payload, job)
+      void Promise.resolve()
+        .then(() => this.opts.run(payload, job))
         .then((result) => { job.result = result; job.state = 'done'; })
         .catch((e: unknown) => { job.error = errorOf(e); job.state = 'failed'; })
         .finally(() => {
