@@ -1,6 +1,7 @@
 import { createReadStream } from 'node:fs';
 import type { ReadStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
+import { validateHeaderValue } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { log } from '../log.js';
 
@@ -45,14 +46,30 @@ export function parseRange(header: string | undefined, size: number): ByteRange 
   return { start, end };
 }
 
+/** A surrogate code unit with no partner — half of a character, and not encodable as UTF-8. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
 /**
  * RFC 6266 / RFC 5987. The name came from a remote server, so it is percent-encoded into the
  * `filename*` form — a raw CR or LF in a header value would be request smuggling.
+ *
+ * This must be total. `encodeURIComponent` throws `URIError: URI malformed` on a lone
+ * surrogate, and an upstream filename carries one the moment a name is truncated mid-character
+ * — so an unguarded encode is a remote kill switch of exactly the kind this module exists to
+ * close. Unpaired surrogates are replaced first, and the encode is wrapped anyway.
  */
 function contentDisposition(filename: string | null): string {
   if (!filename) return 'attachment';
-  const safe = encodeURIComponent(filename).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
-  return `attachment; filename*=UTF-8''${safe}`;
+  const paired = filename.replace(LONE_SURROGATE, '�');
+  try {
+    const safe = encodeURIComponent(paired).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+    return `attachment; filename*=UTF-8''${safe}`;
+  } catch (err) {
+    log.warn('could not encode a suggested filename; sending a bare attachment disposition', {
+      reason: String(err),
+    });
+    return 'attachment';
+  }
 }
 
 const GENERIC_TYPE = 'application/octet-stream';
@@ -73,6 +90,47 @@ function mediaType(value: string | null): string {
   if (/[\r\n\0]/.test(type)) return GENERIC_TYPE;
   if (!MEDIA_TYPE.test(type)) return GENERIC_TYPE;
   return type;
+}
+
+/**
+ * What a header falls back to when Node refuses the value we built. A header named here is
+ * replaced; one that is not is dropped. Both fallbacks are constants, so neither can fail.
+ */
+const HEADER_FALLBACKS: Record<string, string> = {
+  'content-type': GENERIC_TYPE,
+  'content-disposition': 'attachment',
+};
+
+/**
+ * The backstop. Node runs its own validator over every outgoing header value and throws
+ * `ERR_INVALID_CHAR` on a strictly larger set than any shape check here rejects: every C0
+ * control bar HT/LF/CR/NUL, DEL, and *every* codepoint above Latin-1. A `content-type`
+ * parameter carrying `€`, a CJK title, or a stray `\x01` is enough — and none of that is
+ * exotic in a filename an upstream server chose.
+ *
+ * That throw would land inside `writeHead`, after the descriptor is open: an unhandled
+ * rejection and an abandoned fd, from a header a remote server picked. Hand-rolled blacklists
+ * have been wrong twice about which characters those are, so this asks the only authority that
+ * matters — the same predicate `writeHead` is about to apply — and substitutes anything it
+ * refuses. Nothing reaches `writeHead` that Node has not already accepted.
+ */
+function vetHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    try {
+      validateHeaderValue(name, value);
+      out[name] = value;
+    } catch (err) {
+      const fallback = HEADER_FALLBACKS[name];
+      log.warn('an outgoing header value was not one Node will send; substituting', {
+        header: name,
+        reason: String(err),
+        substituted: fallback ?? '(header dropped)',
+      });
+      if (fallback !== undefined) out[name] = fallback;
+    }
+  }
+  return out;
 }
 
 /**
@@ -98,11 +156,11 @@ export async function serveFile(
   const range = parseRange(req.headers.range, opts.size);
 
   if (range === 'unsatisfiable') {
-    res.writeHead(416, {
+    res.writeHead(416, vetHeaders({
       'content-range': `bytes */${opts.size}`,
       'accept-ranges': 'bytes',
       'content-length': '0',
-    });
+    }));
     res.end();
     return;
   }
@@ -120,7 +178,7 @@ export async function serveFile(
   if (range) headers['content-range'] = `bytes ${start}-${end}/${opts.size}`;
 
   if (req.method === 'HEAD' || length === 0) {
-    res.writeHead(range ? 206 : 200, headers);
+    res.writeHead(range ? 206 : 200, vetHeaders(headers));
     res.end();
     return;
   }
@@ -133,27 +191,50 @@ export async function serveFile(
   } catch (err) {
     log.warn('could not open a file to serve', { path: opts.path, error: String(err) });
     const payload = JSON.stringify({ error: 'file unavailable' });
-    res.writeHead(500, {
+    res.writeHead(500, vetHeaders({
       'content-type': 'application/json',
       'content-length': String(Buffer.byteLength(payload)),
-    });
+    }));
     res.end(payload);
     return;
   }
 
-  res.writeHead(range ? 206 : 200, headers);
+  // The client may already be gone: a reset that lands while `fs.open` was in flight leaves a
+  // descriptor with nowhere to send it. `pipeline` rejects ERR_STREAM_UNABLE_TO_PIPE *before*
+  // it takes ownership of the source, so it never closes the stream for us — one leaked fd per
+  // abort, and the window is open-latency, which is widest on exactly the contended disks and
+  // network shares a download gateway serves from.
+  if (res.destroyed) {
+    body.destroy();
+    return;
+  }
+
+  res.writeHead(range ? 206 : 200, vetHeaders(headers));
 
   try {
     await pipeline(body, res);
   } catch (err) {
-    // A client that cancels, seeks away, or times out mid-download makes `pipeline` reject
-    // with ERR_STREAM_PREMATURE_CLOSE. That is routine, not an error, and it must never
-    // escape: an unhandled rejection here would take the daemon down. The status line is
-    // long gone, so there is nothing to say in band — drop the connection and move on.
-    log.warn('download did not finish; the connection went away mid-stream', {
-      path: opts.path,
-      reason: String(err),
-    });
+    // Nothing here may escape: an unhandled rejection would take the daemon down. The status
+    // line is long gone, so there is nothing to say in band — close both ends and move on.
+    // `body` is destroyed explicitly because a rejection that predates `pipeline` taking
+    // ownership leaves the source untouched.
+    body.destroy();
     res.destroy();
+
+    // Two very different events reach this catch, and conflating them makes this log line lie
+    // at 3am. A client that cancels, seeks away, or times out gives ERR_STREAM_PREMATURE_CLOSE
+    // and is routine. Anything else — a truncated file, a revoked permission, a disk error
+    // mid-transfer — is our fault, and must not be filed as a client hang-up.
+    if ((err as NodeJS.ErrnoException | null)?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+      log.warn('download did not finish; the connection went away mid-stream', {
+        path: opts.path,
+        reason: String(err),
+      });
+    } else {
+      log.error('download failed after the response had started', {
+        path: opts.path,
+        reason: String(err),
+      });
+    }
   }
 }

@@ -1,10 +1,11 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer, get, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseRange, serveFile } from '../../src/api/range.js';
+import { log } from '../../src/log.js';
 
 describe('parseRange', () => {
   it('returns null when there is no Range header', () => {
@@ -57,7 +58,24 @@ describe('serveFile', () => {
     if (server) await new Promise<void>((r) => server!.close(() => r()));
     if (dir) await rm(dir, { recursive: true, force: true });
     server = undefined; dir = undefined;
+    vi.restoreAllMocks();
   });
+
+  /**
+   * A request that resolves to `null` instead of hanging when no response ever arrives.
+   *
+   * A header value Node refuses makes `writeHead` throw, and a throw there means the client is
+   * left holding an open socket forever. Collapsing that into `null` is what lets these tests
+   * fail on an assertion — "no response at all" — instead of sitting on a timeout, which is
+   * both slower and a far worse failure message to read.
+   */
+  async function fetchOrNull(url: string, init?: RequestInit): Promise<Response | null> {
+    try {
+      return await fetch(url, { signal: AbortSignal.timeout(2_000), ...init });
+    } catch {
+      return null;
+    }
+  }
 
   async function host(body: string, contentType: string | null = 'application/octet-stream', filename: string | null = 'thing.bin') {
     dir = await mkdtemp(join(tmpdir(), 'gh-range-'));
@@ -176,6 +194,65 @@ describe('serveFile', () => {
     const url = await host('0123456789', 'application/zip; charset=utf-8', 'thing.zip');
     const res = await fetch(url);
     expect(res.headers.get('content-type')).toBe('application/zip; charset=utf-8');
+  });
+
+  // The parameter tail of a media type is where an upstream filename ends up, and Node's
+  // outgoing-header validator refuses a strictly larger character set than any shape check
+  // spells out: every C0 control bar HT/LF/CR/NUL, DEL, and everything above Latin-1. Each of
+  // these once threw inside `writeHead` *after* the descriptor was open — an unhandled
+  // rejection and a leaked fd, from a header a remote server chose. Assert a served response,
+  // because "no response" is the shape that regression takes.
+  it.each([
+    ['a non-Latin-1 character', 'application/zip; name=€.zip'],
+    ['a CJK parameter', 'video/mp4; title=中文'],
+    ['a C0 control', `application/zip; x=${String.fromCharCode(0x01)}y`],
+    ['a DEL', `application/zip; x=${String.fromCharCode(0x7f)}y`],
+  ])('serves a safe content type when the upstream one carries %s', async (_label, contentType) => {
+    const url = await host('0123456789', contentType, 'thing.zip');
+    const res = await fetchOrNull(url);
+    expect(res, 'no response arrived: writeHead threw on the content-type').not.toBeNull();
+    expect(res!.status).toBe(200);
+    expect(res!.headers.get('content-type')).toBe('application/octet-stream');
+    expect(await res!.text()).toBe('0123456789');
+  });
+
+  // A truncated upstream filename carries half a surrogate pair, and `encodeURIComponent`
+  // throws URIError on one. That ran before the stream opened, so it leaked nothing — it just
+  // killed the process.
+  it('serves a sane disposition when the filename holds a lone surrogate', async () => {
+    const url = await host('0123456789', 'application/zip', 'bad\ud800name.zip');
+    const res = await fetchOrNull(url);
+    expect(res, 'no response arrived: the filename encode threw').not.toBeNull();
+    expect(res!.status).toBe(200);
+    const cd = res!.headers.get('content-disposition') ?? '';
+    expect(cd).toContain('attachment');
+    expect(cd).not.toMatch(/[\r\n]/);
+    expect(await res!.text()).toBe('0123456789');
+  });
+
+  // "the connection went away mid-stream" is the line someone reads at 3am. A truncated file,
+  // a revoked permission or a disk fault must not arrive wearing a client's clothes.
+  it('reports a server-side read fault as an error, not as a client hang-up', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(log, 'error').mockImplementation(() => {});
+
+    dir = await mkdtemp(join(tmpdir(), 'gh-range-'));
+    server = createServer((req, res) => {
+      // A directory where a file is expected: it opens, then faults on the first read.
+      void serveFile(req, res, { path: dir!, size: 4096, contentType: null, filename: 'd' });
+    });
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
+    await fetchOrNull(`http://127.0.0.1:${(server!.address() as AddressInfo).port}/`);
+    await new Promise<void>((r) => setTimeout(r, 100));
+
+    expect(error).toHaveBeenCalledWith(
+      expect.not.stringContaining('connection went away'),
+      expect.objectContaining({ reason: expect.stringContaining('EISDIR') }),
+    );
+    expect(warn).not.toHaveBeenCalledWith(
+      expect.stringContaining('connection went away'),
+      expect.anything(),
+    );
   });
 
   // A gateway that dies when a file is missing or a client hangs up is a gateway that dies
