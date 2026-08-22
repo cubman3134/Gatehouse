@@ -102,10 +102,10 @@ export class JobQueue<P, R> {
       const payload = this.payloads.get(id);
       if (!job || payload === undefined) continue;
 
+      job.state = 'running';
       this.running++;
-      Promise.resolve().then(() => { job.state = 'running'; });
-      void this.opts
-        .run(payload, job)
+      void Promise.resolve()
+        .then(() => this.opts.run(payload, job))
         .then((result) => { job.result = result; job.state = 'done'; })
         .catch((e: unknown) => { job.error = errorOf(e); job.state = 'failed'; })
         .finally(() => {

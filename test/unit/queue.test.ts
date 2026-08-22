@@ -29,12 +29,33 @@ describe('JobQueue', () => {
 
     const job = q.submit('k1', 'alpha');
     expect(job.id).toBe('job-1');
-    expect(job.state).toBe('queued');
+    // submit() starts the work synchronously when a slot is free, so 'running' is the honest reading.
+    expect(job.state).toBe('running');
 
     const done = await q.wait(job.id);
     expect(done.state).toBe('done');
     expect(done.result).toBe('ran:alpha');
     expect(done.createdAt).toBe(1000);
+  });
+
+  it('queues jobs when concurrency is full', async () => {
+    const g = gate();
+    const q = new JobQueue<string, string>({ concurrency: 1, idgen: ids(), now: () => 0, run: g.run });
+
+    const job1 = q.submit('a', 'a');
+    expect(job1.state).toBe('running');
+
+    const job2 = q.submit('b', 'b');
+    expect(job2.state).toBe('queued');
+
+    await Promise.resolve(); // Wait for run() to be called
+
+    g.opened[0]!('done');
+    await new Promise((r) => setTimeout(r, 0)); // Wait for pump() to start job2
+
+    expect(job2.state).toBe('running');
+    g.opened[1]!('done');
+    await q.wait(job2.id);
   });
 
   it('records a failure code when the worker throws', async () => {
@@ -63,6 +84,35 @@ describe('JobQueue', () => {
     expect(done.error?.message).toBe('socket died');
   });
 
+  it('handles a synchronously-throwing run function', async () => {
+    let callCount = 0;
+    const q = new JobQueue<string, string>({
+      concurrency: 1,
+      idgen: ids(),
+      now: () => 0,
+      run: () => {
+        callCount++;
+        if (callCount === 1) {
+          throw Object.assign(new Error('sync boom'), { code: 'blocked' });
+        }
+        return Promise.resolve('ok');
+      },
+    });
+
+    const job1 = q.submit('k1', 'x');
+    const done1 = await q.wait(job1.id);
+    expect(done1.state).toBe('failed');
+    expect(done1.error?.message).toBe('sync boom');
+    expect(q.busy).toBe(0);
+
+    // Verify subsequent jobs still run
+    const job2 = q.submit('k2', 'y');
+    expect(q.busy).toBe(1);
+    const done2 = await q.wait(job2.id);
+    expect(done2.state).toBe('done');
+    expect(q.busy).toBe(0);
+  });
+
   it('dedupes an identical key that is still in flight', async () => {
     const g = gate();
     const q = new JobQueue<string, string>({ concurrency: 4, idgen: ids(), now: () => 0, run: g.run });
@@ -71,6 +121,8 @@ describe('JobQueue', () => {
     const b = q.submit('same', 'x');
     expect(b.id).toBe(a.id);
     expect(q.depth).toBe(1);
+
+    await Promise.resolve(); // Wait for run() to be called
 
     g.opened[0]!('done');
     await q.wait(a.id);
@@ -99,6 +151,7 @@ describe('JobQueue', () => {
     g.opened[0]!('first');
     await new Promise((r) => setTimeout(r, 0));
     expect(g.opened.length).toBe(3);
+    expect(q.busy).toBe(2);
   });
 
   it('returns undefined for an unknown id and rejects a wait on one', async () => {
