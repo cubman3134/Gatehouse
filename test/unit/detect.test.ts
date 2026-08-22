@@ -35,7 +35,7 @@ describe('classify', () => {
   });
 
   it('calls a 1020 body blocked, and blocked beats every other marker', () => {
-    const html = '<div id="challenge-form"></div>error code: 1020';
+    const html = '<div id="challenge-form"></div><div class="cf-turnstile"></div>error code: 1020';
     expect(classify(snap({ status: 403, html }))).toBe('blocked');
   });
 
@@ -45,5 +45,19 @@ describe('classify', () => {
 
   it('does not call a plain 403 from a non-Cloudflare host challenged', () => {
     expect(classify(snap({ status: 403, html: '<h1>Forbidden</h1>' }))).toBe('clear');
+  });
+
+  it.each([
+    ['error code: 1020', 'blocked'],
+    ['error 1020', 'blocked'],
+    ['error code: 1015', 'blocked'],
+    ['error 1015', 'blocked'],
+    ['cf-turnstile', 'interactive'],
+    ['challenges.cloudflare.com/turnstile', 'interactive'],
+    ['challenge-form', 'challenged'],
+    ['challenge-platform', 'challenged'],
+    ['cf_chl_opt', 'challenged'],
+  ])('exercises individual markers: "%s" → %s', (marker, expected) => {
+    expect(classify(snap({ html: marker }))).toBe(expected);
   });
 });
