@@ -59,6 +59,36 @@ describe('fake Cloudflare fixture', () => {
     expect(res.headers.get('set-cookie')).toBeNull();
   });
 
+  /**
+   * 'managed' mode is the measured real-world shape: a 403 that carries the Turnstile script
+   * host from the first byte, grows a widget while still challenged, and then solves itself.
+   * The widget marker must NOT be in the served source — it is appended by script — or the
+   * fixture cannot show the widget arriving mid-challenge.
+   */
+  it('managed mode serves a challenged 403 with the turnstile script host and no widget yet', async () => {
+    fx = await startCloudflareFixture({ mode: 'managed' });
+    const res = await fetch(fx.url);
+    const body = await res.text();
+
+    expect(res.status).toBe(403);
+    expect(res.headers.get('cf-mitigated')).toBe('challenge');
+    expect(body).not.toContain(PAYLOAD_MARKER);
+    expect(body).toContain('challenges.cloudflare.com/turnstile');
+    expect(body).toContain('challenge-platform');
+    expect(body).toContain('cf_chl_opt');
+    expect(body).not.toContain('cf-turnstile');
+    // It self-solves: the auto-verify hop a real browser will take is right there.
+    expect(body).toContain('/cdn-cgi/verify');
+  });
+
+  it('managed mode mints the cookie on the verify hop, exactly like js mode', async () => {
+    fx = await startCloudflareFixture({ mode: 'managed' });
+    const res = await fetch(new URL('/cdn-cgi/verify', fx.url), { redirect: 'manual' });
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('set-cookie')).toContain('cf_clearance=');
+  });
+
   it('picks the right cookie among decoys and keeps a value containing "="', async () => {
     fx = await startCloudflareFixture();
     const res = await fetch(fx.url, {

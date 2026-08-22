@@ -82,13 +82,56 @@ describe('the real app against the fake Cloudflare', () => {
     expect(fx.paths.filter((p) => p === '/cdn-cgi/verify').length).toBe(beforeVerifies);
   }, 60_000);
 
-  it('fails cleanly on an interactive challenge instead of hanging', async () => {
+  /**
+   * THE CASE THE PRODUCT EXISTS FOR. Cloudflare's managed challenge draws a Turnstile widget
+   * while it solves itself — measured on a real host, widget at t=1s, cleared at t=2s, no
+   * human anywhere. Reading that widget as "needs a person" aborted the solve one second
+   * before it would have succeeded, which is this whole bug. Gatehouse must sit through it
+   * and come back with the payload.
+   */
+  it('solves a managed challenge that shows a turnstile widget and then clears itself', async () => {
+    const managed = await startCloudflareFixture({ mode: 'managed', managedSolveDelayMs: 1500 });
+    try {
+      const { status, json } = await v1({
+        cmd: 'request.get',
+        url: managed.url + '/',
+        session: 'managed',
+        maxTimeout: 30000,
+      });
+
+      expect(status).toBe(200);
+      expect(json.status).toBe('ok');
+      expect(json.solution.response).toContain(PAYLOAD_MARKER);
+      expect(json.solution.status).toBe(200);
+      const clearance = json.solution.cookies.find((c: any) => c.name === 'cf_clearance');
+      expect(clearance?.value).toBe(managed.secret);
+      // It really did go through the challenge — the auto-verify hop was taken, so the poll
+      // loop sat on a page carrying a turnstile widget rather than bailing on it.
+      expect(managed.paths).toContain('/cdn-cgi/verify');
+    } finally {
+      await managed.close();
+    }
+  }, 60_000);
+
+  /**
+   * A challenge that genuinely never clears must still fail — but at the deadline, not on
+   * sight of a widget. The message names the interactive possibility; the code stays
+   * `challenge-failed` (there is no `pending-human` path until increment 3).
+   */
+  it('runs an interactive challenge to its deadline and then fails cleanly', async () => {
     const interactive = await startCloudflareFixture({ mode: 'interactive' });
     try {
-      const { status, json } = await v1({ cmd: 'request.get', url: interactive.url + '/', maxTimeout: 8000 });
+      const began = Date.now();
+      const { status, json } = await v1({ cmd: 'request.get', url: interactive.url + '/', maxTimeout: 4000 });
+      const elapsed = Date.now() - began;
+
       expect(status).toBe(500);
       expect(json.status).toBe('error');
       expect(json.message).toMatch(/interactive/i);
+      expect(json.message).toMatch(/4000ms/);
+      // It waited: the old behaviour refused on the first snapshot, well inside a second.
+      expect(elapsed).toBeGreaterThan(3000);
+      expect(elapsed).toBeLessThan(30_000);
     } finally {
       await interactive.close();
     }

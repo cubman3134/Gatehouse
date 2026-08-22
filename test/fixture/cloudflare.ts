@@ -19,8 +19,14 @@ export interface FixtureOptions {
   /**
    * 'js'          — the interstitial auto-solves via a script (a real browser clears it).
    * 'interactive' — the interstitial needs a human click and has no auto-verify path.
+   * 'managed'     — Cloudflare's *managed* challenge as measured in the wild: a Turnstile
+   *                 widget appears while the page is still challenged, and then the page
+   *                 solves itself with no human involved. This is the case Gatehouse exists
+   *                 for, and the one an "interactive == turnstile present" reading breaks.
    */
-  mode?: 'js' | 'interactive';
+  mode?: 'js' | 'interactive' | 'managed';
+  /** 'managed' only: how long the interstitial waits before solving itself. */
+  managedSolveDelayMs?: number;
 }
 
 function jsInterstitial(): string {
@@ -28,6 +34,39 @@ function jsInterstitial(): string {
 <div id="challenge-form"></div>
 <p>Checking your browser before accessing the site.</p>
 <script>setTimeout(function () { location.href = '/cdn-cgi/verify'; }, 250);</script>
+</body></html>`;
+}
+
+/**
+ * Reproduces the measured real-world timeline (hydralinks.cloud, 2026-08-22, one snapshot a
+ * second, no human present):
+ *
+ *   t=0     challenged, script host + challenge-platform + cf_chl_opt, no widget yet
+ *   t≈1000  challenged, and now a Turnstile widget too
+ *   t≈2000  cleared on its own, cf_clearance issued
+ *
+ * The widget is appended by script rather than served in the markup, so the widget marker is
+ * genuinely absent from the first snapshots — and for that to hold, the literal marker must
+ * not appear anywhere in the served source, hence the split string below.
+ */
+function managedInterstitial(solveDelayMs: number): string {
+  const widgetAt = Math.max(0, Math.round(solveDelayMs * 0.35));
+  // The script host is recorded as text rather than as a real <script src>: the marker has to
+  // be in the DOM from t=0, but a test suite must not reach out to cloudflare.com to get it.
+  return `<!doctype html><html><head><title>${CHALLENGE_TITLE}</title>
+<script>window.__cfChlScript = 'https://challenges.cloudflare.com/turnstile/v0/api.js';</script>
+</head><body>
+<div id="challenge-platform"></div>
+<script>window._cf_chl_opt = { cvId: '3' };</script>
+<p>Checking your browser before accessing the site.</p>
+<script>
+setTimeout(function () {
+  var d = document.createElement('div');
+  d.className = 'cf-' + 'turnstile';
+  document.body.appendChild(d);
+}, ${widgetAt});
+setTimeout(function () { location.href = '/cdn-cgi/verify'; }, ${solveDelayMs});
+</script>
 </body></html>`;
 }
 
@@ -58,6 +97,7 @@ function cookieValue(req: IncomingMessage, name: string): string | undefined {
 
 export async function startCloudflareFixture(opts: FixtureOptions = {}): Promise<Fixture> {
   const mode = opts.mode ?? 'js';
+  const managedSolveDelayMs = opts.managedSolveDelayMs ?? 1100;
   const secret = randomUUID();
   const paths: string[] = [];
 
@@ -66,9 +106,9 @@ export async function startCloudflareFixture(opts: FixtureOptions = {}): Promise
     const path = (req.url ?? '/').split('?')[0] ?? '/';
     paths.push(path);
 
-    // The verify endpoint only exists in 'js' mode and mints the clearance cookie
-    // when reached. In 'interactive' mode, the endpoint does not exist.
-    if (path === '/cdn-cgi/verify' && mode === 'js') {
+    // The verify endpoint exists in the self-solving modes ('js', 'managed') and mints the
+    // clearance cookie when reached. In 'interactive' mode, the endpoint does not exist.
+    if (path === '/cdn-cgi/verify' && mode !== 'interactive') {
       res.writeHead(302, {
         'set-cookie': `cf_clearance=${secret}; Path=/; HttpOnly`,
         location: '/',
@@ -83,12 +123,17 @@ export async function startCloudflareFixture(opts: FixtureOptions = {}): Promise
       return;
     }
 
-    res.writeHead(503, {
+    // 403 for 'managed', matching what the real challenged host answered with.
+    res.writeHead(mode === 'managed' ? 403 : 503, {
       'content-type': 'text/html; charset=utf-8',
       'cf-mitigated': 'challenge',
       'cache-control': 'no-store',
     });
-    res.end(mode === 'js' ? jsInterstitial() : interactiveInterstitial());
+    if (mode === 'managed') {
+      res.end(managedInterstitial(managedSolveDelayMs));
+    } else {
+      res.end(mode === 'js' ? jsInterstitial() : interactiveInterstitial());
+    }
   });
 
   await new Promise<void>((resolve, reject) => {
