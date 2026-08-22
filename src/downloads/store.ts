@@ -20,6 +20,13 @@ export interface DownloadInit {
 const MANIFEST = 'manifest.json';
 
 /**
+ * The only shape an id may take. It is a filename component, so this is what stops one
+ * walking out of the downloads directory. Ids we mint are UUIDs, which satisfy it; the check
+ * exists for ids that arrive from the manifest on disk, which is an editable file.
+ */
+const ID = /^[A-Za-z0-9_-]+$/;
+
+/**
  * Durable home for download records. The queue that schedules a transfer is ephemeral and its
  * jobs are pruned on settle; THIS is what `/gh/jobs/:id` reads, which is why a caller can poll
  * — and fetch the bytes — long after the transfer finished.
@@ -38,11 +45,11 @@ export class DownloadStore {
 
   /** `<id>.part` while transferring, `<id>.bin` once complete. Never a remote-supplied name. */
   partPath(id: string): string {
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`invalid id: ${id}`);
+    if (!ID.test(id)) throw new Error(`invalid id: ${id}`);
     return join(this.opts.dir, `${id}.part`);
   }
   filePath(id: string): string {
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`invalid id: ${id}`);
+    if (!ID.test(id)) throw new Error(`invalid id: ${id}`);
     return join(this.opts.dir, `${id}.bin`);
   }
 
@@ -58,6 +65,14 @@ export class DownloadStore {
       const parsed = JSON.parse(raw) as unknown;
       if (!Array.isArray(parsed)) throw new Error('manifest is not an array');
       for (const r of parsed as DownloadRecord[]) {
+        // The manifest is a plain file an operator can edit, and nothing downstream re-checks
+        // the id it hands to `filePath`/`partPath` — those throw, from inside a request
+        // handler and from the sweep. Admitting an id we could never have minted turns a
+        // hand-edited manifest into a 500 on an unrelated request, so drop it here instead.
+        if (r && typeof r.id === 'string' && !ID.test(r.id)) {
+          log.warn('dropping a downloads manifest record whose id is not a usable filename', { id: r.id });
+          continue;
+        }
         if (r && typeof r.id === 'string') {
           // Nothing can be mid-transfer across a restart: the process that owned it is gone.
           // Demote so a stale `running` cannot block dedupe or survive a sweep forever.

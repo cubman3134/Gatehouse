@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DownloadStore } from '../../src/downloads/store.js';
+import { log } from '../../src/log.js';
 
 let dir: string;
 let clock = 1000;
@@ -173,6 +174,33 @@ describe('DownloadStore', () => {
     expect(r?.error?.code).toBe('cancelled');
     expect(r?.completedAt).not.toBeNull();
     expect(s.findOpen('x.test', 'http://x.test/a')).toBeUndefined();
+  });
+
+  // A hand-edited or corrupt manifest can hold an id that is not one we could ever have
+  // minted. `filePath`/`partPath` throw on those, and they are called from inside request
+  // handlers and from the sweep — so the id has to be refused at the door, not later.
+  it('drops a manifest record whose id could never be a path', async () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    try {
+      await writeFile(
+        join(dir, 'manifest.json'),
+        JSON.stringify([
+          { id: '../../evil', url: 'http://x.test/a', session: 'x.test', referer: null, suggestedName: null, contentType: null, size: 1, received: 1, sha256: 'z', state: 'done', createdAt: 1, completedAt: 1, lastAccessAt: 1 },
+          { id: 'd9', url: 'http://x.test/b', session: 'x.test', referer: null, suggestedName: null, contentType: null, size: 1, received: 1, sha256: 'z', state: 'done', createdAt: 1, completedAt: 1, lastAccessAt: 1 },
+        ]),
+        'utf8',
+      );
+
+      const s = mk(); await s.load();
+      expect(s.get('../../evil')).toBeUndefined();
+      expect(s.all().map((r) => r.id)).toEqual(['d9']);
+      expect(warn).toHaveBeenCalled();
+
+      // And the store still works: nothing downstream can be handed the bad id.
+      await expect(s.sweep()).resolves.toBeDefined();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('rejects invalid ids in filePath', async () => {
