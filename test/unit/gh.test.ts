@@ -60,6 +60,30 @@ describe('POST /gh/fetch', () => {
     expect(submitted).toEqual([]);
   });
 
+  // The one caller-supplied field forwarded to a third party as an outbound header.
+  it('rejects a referer that is not an http(s) URL', async () => {
+    const CRLF = String.fromCharCode(13, 10);
+    for (const bad of ['javascript:alert(1)', 'file:///C:/x', 'not a url', 'evil' + CRLF + 'X: 1']) {
+      // Bounded: without the guard the handler can throw and never answer, and a test that can
+      // only fail by wall-clock timeout is the failure mode this project keeps re-learning.
+      const res = await fetch(`${base}/gh/fetch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: 'http://example.test/f.bin', referer: bad }),
+        signal: AbortSignal.timeout(2_000),
+      }).catch(() => null);
+      expect(res, `referer ${JSON.stringify(bad)}: no response arrived`).not.toBeNull();
+      expect(res!.status, `referer ${JSON.stringify(bad)} should be refused`).toBe(400);
+    }
+    expect(submitted).toEqual([]);
+  });
+
+  it('accepts and normalises a valid referer', async () => {
+    const res = await post({ url: 'http://example.test/f.bin', referer: 'https://example.test' });
+    expect(res.status).toBe(202);
+    expect(store.get('d1')?.referer).toBe('https://example.test/');
+  });
+
   it('rejects a hostile session name', async () => {
     const res = await post({ url: 'http://example.test/f.bin', site: '../../etc' });
     expect(res.status).toBe(400);

@@ -121,11 +121,26 @@ export class DownloadStore {
     await this.save();
   }
 
-  /** Drop the record and both possible files. Returns false if the id was unknown. */
+  /**
+   * Drop the record and both possible files. Returns false if the id was unknown.
+   *
+   * The unlinks are best-effort. `force` suppresses ENOENT only — an EPERM or EBUSY from an
+   * antivirus scanner or a search indexer holding the file is ordinary on Windows, and this
+   * runs inside a request handler, where a rejection would escape as an unhandled one. Losing
+   * the record while the bytes linger is a leak the retention sweep cannot see; crashing the
+   * daemon is worse, so we log and carry on.
+   */
   async remove(id: string): Promise<boolean> {
     if (!this.records.delete(id)) return false;
-    await rm(this.partPath(id), { force: true });
-    await rm(this.filePath(id), { force: true });
+    for (const path of [this.partPath(id), this.filePath(id)]) {
+      try {
+        await rm(path, { force: true });
+      } catch (e: unknown) {
+        log.warn('could not delete a download file; the record is gone but the bytes remain', {
+          id, path, reason: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
     await this.save();
     return true;
   }

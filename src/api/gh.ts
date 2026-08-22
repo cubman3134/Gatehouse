@@ -4,6 +4,7 @@ import type { DownloadStore } from '../downloads/store.js';
 import { isSettled } from '../downloads/record.js';
 import { serveFile } from './range.js';
 import { validateTarget, isTargetError } from './target.js';
+import { log } from '../log.js';
 
 export interface GhDeps {
   store: DownloadStore;
@@ -110,7 +111,21 @@ async function postFetch(req: IncomingMessage, res: ServerResponse, deps: GhDeps
   const open = deps.store.findOpen(target.session, target.url);
   if (open) { sendJson(res, 202, { jobId: open.id, state: open.state }); return; }
 
-  const referer = typeof body.referer === 'string' ? body.referer : null;
+  // The one caller-supplied field we hand to a THIRD party: `transfer` sends it as an outbound
+  // `Referer`. Node's own validator would throw rather than let a CRLF split the request, but
+  // that throw is a fault we would rather not manufacture — and the value is persisted into a
+  // manifest that is rewritten in full on every progress tick, so an oversized one is
+  // amplified across the whole transfer. Accept only a plain http(s) URL.
+  let referer: string | null = null;
+  if (typeof body.referer === 'string' && body.referer !== '') {
+    let parsedReferer: URL | null = null;
+    try { parsedReferer = new URL(body.referer); } catch { parsedReferer = null; }
+    if (!parsedReferer || (parsedReferer.protocol !== 'http:' && parsedReferer.protocol !== 'https:')) {
+      sendError(res, 400, 'bad-request', 'referer must be an http or https URL');
+      return;
+    }
+    referer = parsedReferer.href;
+  }
   const rec = await deps.store.create({ url: target.url, session: target.session, referer });
   deps.submit(rec.id);
   sendJson(res, 202, { jobId: rec.id, state: rec.state });
@@ -163,7 +178,18 @@ async function getFile(req: IncomingMessage, res: ServerResponse, id: string, de
 
   const path = deps.store.filePath(id);
   let size: number;
-  try { size = (await stat(path)).size; } catch { sendError(res, 404, 'not-found', `bytes for ${id} are gone`); return; }
+  try {
+    size = (await stat(path)).size;
+  } catch (e: unknown) {
+    // ENOENT really is "gone". Anything else — EACCES, EIO — is a fault on our side that
+    // would otherwise present to an operator as a vanished file, so say so in the log.
+    const code = (e as NodeJS.ErrnoException | null)?.code;
+    if (code !== 'ENOENT') {
+      log.error('could not read a completed download from disk', { id, path, reason: String(e) });
+    }
+    sendError(res, 404, 'not-found', `bytes for ${id} are gone`);
+    return;
+  }
 
   await deps.store.touch(id);
   await serveFile(req, res, { path, size, contentType: rec.contentType, filename: rec.suggestedName });
