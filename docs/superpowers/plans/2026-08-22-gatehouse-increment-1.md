@@ -1740,6 +1740,53 @@ export function makeSolver(pool: BrowserPool): Solver {
 }
 ```
 
+> **Amended during Task 7 review — the `solve.ts` above contains a CRITICAL defect.**
+>
+> `session.webRequest.onHeadersReceived` is a **setter, not an emitter**: a second call
+> replaces the first, and the `null` overload clears the slot wholesale. But `BrowserPool`
+> only reuses windows sitting in the *free* list, so a second concurrent `acquire()` on the
+> same session builds a second window on the identical partition — and Electron caches one
+> `Session` per partition, so both solves share one `webRequest`.
+>
+> Result: solve B's registration **evicts** solve A's listener. A's `status` stays at its
+> initializer `0` and `headers` at `{}` forever. With no headers, `classify` loses the
+> `cf-mitigated: challenge` signal and falls through to HTML markers alone — so an
+> interstitial lacking `challenge-form`/`challenge-platform`/`cf_chl_opt` is judged **clear**,
+> and the interstitial HTML is returned to the caller as `solution.response`. **It fails
+> open.** Worse, whichever solve finishes first calls `onHeadersReceived(null)`, so the
+> survivor sees no headers for the rest of its solve — including the post-challenge redirect
+> chain, the one phase whose status matters.
+>
+> Reachable with the shipped defaults: `concurrency` is 2, `/v1` derives the session from the
+> hostname, and the dedupe key includes the URL — so two paths on one host are two concurrent
+> jobs on one session. That is the ordinary case for a FlareSolverr client.
+>
+> **Correct shape:** one refcounted listener per session, demultiplexing on
+> `details.webContentsId` into a per-`webContents` record; deregister only when the last solve
+> on that session releases. Cover it with an integration test issuing two concurrent requests
+> to different paths on one host.
+>
+> Also missing from the code above, all found in the same review:
+>
+> - **`maxTimeout` does not bound the navigation.** `await wc.loadURL(...)` runs before the
+>   deadline is ever consulted, so a host that accepts and then stalls pins a pool window and
+>   a queue slot forever. With `concurrency: 2`, two stalled hosts wedge the service
+>   permanently. Race the solve against the deadline.
+> - **`npm test` must build first.** `main` is `dist/main.js` and the harness spawns
+>   `electron .`, so bare `vitest run` tests whatever was compiled last — a green run against
+>   stale code, which is precisely the failure this integration design exists to prevent. Make
+>   the script `tsc && vitest run` AND have the harness refuse to run if `dist/main.js` is
+>   missing or older than the newest `src/**/*.ts`.
+> - **`solveTimeoutMs` is a dead knob** unless `main.ts` clamps the client-supplied
+>   `maxTimeout` to it.
+> - **`loadConfig` belongs inside the `try`**, or a `ConfigError` bypasses the `log.error` +
+>   `app.exit(1)` handler and the operator gets an unhandled-rejection dump instead of the
+>   sentence telling them what to set.
+> - `executeJavaScript(GRAB_HTML, true)` — the `true` is `userGesture`, an unnecessary grant
+>   to hostile page code. Use `false`.
+> - Read `win.webContents` and its session INSIDE the `try`, or a throw there skips `finally`,
+>   never releases the window, and permanently inflates `busy`.
+
 - [ ] **Step 3: Implement `src/main.ts`**
 
 ```ts
