@@ -7,7 +7,9 @@
   "scripts": {
     "test": "tsc && vitest run",
     "build": "tsc",
-    "start": "electron ."
+    "start": "electron .",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "tsc && vitest run test/integration"
   },
   "license": "UNLICENSED",
   "type": "module",
