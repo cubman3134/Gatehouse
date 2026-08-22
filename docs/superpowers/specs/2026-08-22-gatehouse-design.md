@@ -182,12 +182,33 @@ rather than an omission.
 Load in a hidden window on the site's partition, then wait for an outcome rather than a fixed
 sleep:
 
-1. **Cleared** — no `cf-mitigated` header, status not 403/503, no `#challenge-form` or
-   `cf-turnstile` in the DOM, document settled. Return the HTML.
-2. **Still challenged after `maxTimeout`** — the non-interactive challenge normally clears in
-   ~5s, so this is the interactive kind. Surface the window; job becomes `pending-human`.
+1. **Cleared** — no `cf-mitigated` header, status not 403/503, no challenge markup, document
+   settled. Return the HTML.
+2. **Still challenged after `maxTimeout`** — only now is it possibly the interactive kind.
+   Surface the window; job becomes `pending-human`.
 3. **Hard block** — 1020/1015, or repeated challenge failure. Fail fast with a distinct code. Do
    **not** retry in a loop; hammering a soft block is how it becomes permanent.
+
+> **Corrected 2026-08-22 by live verification — do not undo this.** An earlier version treated a
+> Turnstile widget in the DOM as an *immediate* "interactive" verdict. That is wrong, and it
+> broke the product against the first real site it met. Measured against a live challenged host,
+> Cloudflare's **managed** challenge renders a Turnstile **invisibly and solves it itself**:
+>
+> ```
+> t=0     403 cf-mitigated=challenge   markers=[challenges.cloudflare.com/turnstile,
+>                                               challenge-platform, cf_chl_opt]
+> t=1000  403                          markers=[cf-turnstile, ...]   <- widget appears
+> t=2000  200 + cf_clearance + the real 11.4MB body                   <- self-solved, no human
+> ```
+>
+> So the presence of a widget carries **no** signal about whether a person is needed, and
+> `challenges.cloudflare.com/turnstile` least of all — it is the script host injected on the
+> normal invisible path, present from the first byte. Turnstile markers therefore mean **keep
+> polling**. "Needs a human" is a judgement made *only* when the deadline expires with a widget
+> still present.
+>
+> The local fixture could not have caught this: it modelled interactive as
+> widget-present, which is simply not how the real thing behaves.
 
 Once a partition has cleared a host, later requests on that partition normally skip all of this.
 That is the reason partitions are persistent.
