@@ -10,8 +10,9 @@
 
 ## Global Constraints
 
-- **Node** >= 20.
-- **Electron** >= 30. Install with `npm i -D electron@latest` and record the resolved version in `package.json` as an exact pin (no `^`).
+- **Node** >= 22.12.0. (Corrected during Task 1: the plan originally said >= 20, but Electron 43 declares `engines: node >= 22.12.0`. Reality wins; `package.json` records the real floor.)
+- **Electron** >= 30. Install with `npm i -D electron@latest` and record the resolved version in `package.json` as an exact pin (no `^`). Pinned at **43.4.1**. Note Electron 43 has no `postinstall`, so `npm ci` alone does NOT fetch the ~235MB binary.
+- **TypeScript module resolution is `nodenext`**, not `bundler`. (Corrected during Task 1.) `bundler` typechecks extensionless relative imports clean and emits ESM that Electron cannot load; `nodenext` enforces the `.js` extension at compile time. All `src/` imports carry `.js`.
 - **The `/v1` response shape is not ours to design.** It matches FlareSolverr. Any deviation breaks the increment's entire premise.
 - **Allarr's read path is the acceptance bar:** the response MUST carry a non-empty `solution.userAgent` and a `solution.cookies` entry with `name === "cf_clearance"` and a non-empty `value`. Allarr ignores every other field.
 - **Allarr sends no `Authorization` header.** Loopback binds MUST NOT require auth.
@@ -386,9 +387,11 @@ export async function startCloudflareFixture(opts: FixtureOptions = {}): Promise
     const path = (req.url ?? '/').split('?')[0] ?? '/';
     paths.push(path);
 
-    // The verify hop mints the clearance cookie. Only a client that executed the
-    // interstitial's script ever reaches it in 'js' mode; 'interactive' never links here.
-    if (path === '/cdn-cgi/verify') {
+    // The verify hop mints the clearance cookie, and exists ONLY in 'js' mode. Gating it on
+    // the mode rather than merely not linking to it is the point: an ungated endpoint lets a
+    // client that knows the well-known Cloudflare verify URL clear 'interactive' with no
+    // human, which would leave the pending-human branch silently untested.
+    if (path === '/cdn-cgi/verify' && mode === 'js') {
       res.writeHead(302, {
         'set-cookie': `cf_clearance=${secret}; Path=/; HttpOnly`,
         location: '/',
@@ -532,9 +535,15 @@ export interface PageSnapshot {
 export type Verdict = 'clear' | 'challenged' | 'interactive' | 'blocked';
 
 /** Cloudflare's terminal codes. Retrying these makes a soft block permanent. */
-const BLOCK_MARKERS = ['error code: 1020', 'error 1020', 'error code: 1015', 'error 1015'];
-const INTERACTIVE_MARKERS = ['cf-turnstile', 'data-sitekey'];
-const CHALLENGE_MARKERS = ['challenge-form', 'challenge-platform', 'cf_chl_opt', 'just a moment'];
+const BLOCK_MARKERS = ['error code: 1020', 'error 1020', 'error code: 1015', 'error 1015'] as const;
+// Cloudflare-owned only. `data-sitekey` was REJECTED: it is reCAPTCHA's and hCaptcha's
+// attribute, so a page that HAS cleared Cloudflare but carries a third-party captcha on a
+// login form would be read as an unsolvable challenge and the poll loop would never finish.
+const INTERACTIVE_MARKERS = ['cf-turnstile', 'challenges.cloudflare.com/turnstile'] as const;
+// `just a moment` was REJECTED as too generic — it matches ordinary copy like "Just a moment,
+// loading your cart". The markers below plus the cf-mitigated header identify the real
+// interstitial without it.
+const CHALLENGE_MARKERS = ['challenge-form', 'challenge-platform', 'cf_chl_opt'] as const;
 
 function header(headers: Record<string, string>, name: string): string | undefined {
   const want = name.toLowerCase();
@@ -560,7 +569,7 @@ export function classify(snap: PageSnapshot): Verdict {
   if (INTERACTIVE_MARKERS.some((m) => html.includes(m))) return 'interactive';
 
   const mitigated = header(snap.headers, 'cf-mitigated');
-  if (mitigated !== undefined && mitigated.toLowerCase() === 'challenge') return 'challenged';
+  if (mitigated !== undefined && mitigated.trim().toLowerCase() === 'challenge') return 'challenged';
 
   if (CHALLENGE_MARKERS.some((m) => html.includes(m))) return 'challenged';
 
@@ -637,7 +646,10 @@ describe('JobQueue', () => {
 
     const job = q.submit('k1', 'alpha');
     expect(job.id).toBe('job-1');
-    expect(job.state).toBe('queued');
+    // submit() claims the slot synchronously when one is free, so 'running' is the honest
+    // reading here. (The plan originally asserted 'queued', which contradicted its own
+    // pump() — caught reviewing task 4.)
+    expect(job.state).toBe('running');
 
     const done = await q.wait(job.id);
     expect(done.state).toBe('done');
@@ -829,10 +841,15 @@ export class JobQueue<P, R> {
       const payload = this.payloads.get(id);
       if (!job || payload === undefined) continue;
 
+      // Synchronously, in this order: mark running, claim the slot, THEN start the work on a
+      // microtask. Deferring the state instead would let a worker that sets job.state in its
+      // own prologue (e.g. 'pending-human') have it clobbered a microtask later. Starting the
+      // work via Promise.resolve() means a run() that throws SYNCHRONOUSLY lands in .catch
+      // rather than escaping pump() and leaking the slot forever.
       job.state = 'running';
       this.running++;
-      void this.opts
-        .run(payload, job)
+      void Promise.resolve()
+        .then(() => this.opts.run(payload, job))
         .then((result) => { job.result = result; job.state = 'done'; })
         .catch((e: unknown) => { job.error = errorOf(e); job.state = 'failed'; })
         .finally(() => {
@@ -1144,6 +1161,30 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
 Run: `npx vitest run test/unit/v1.test.ts`
 Expected: PASS, 10 tests
 
+> **Amended during Task 5 review.** The code above is the starting shape; it is missing the
+> input validation this boundary owes the browser behind it. `handleV1` is where an untrusted
+> JSON body becomes a real Chromium navigation and a real filesystem partition name, so it
+> must additionally:
+>
+> - **Allow only `http:` and `https:` URLs.** Without a scheme allow-list,
+>   `{"cmd":"request.get","url":"file:///C:/Users/you/.ssh/id_rsa"}` is handed to the browser
+>   and the file comes back to the caller in `solution.response` — arbitrary local file read
+>   through a local service.
+> - **Validate a caller-supplied `session` against `/^[A-Za-z0-9._-]{1,64}$/`** (and reject
+>   all-dots names). It becomes `persist:<session>`; `../../../../etc` is path traversal.
+> - **Sanitize a *derived* session** rather than rejecting it: lowercase, replace anything
+>   outside `[a-z0-9.-]` with `-`, truncate to 64, fall back to `default`. IPv6 hosts arrive
+>   as `[::1]`, whose brackets and colons are not legal path components.
+> - **Fall back to `default` when `hostname` is empty**, not only when parsing throws —
+>   `mailto:`, `file:`, `data:` and `about:` URLs all parse fine with no host.
+> - **Clamp `maxTimeout` to at most 300000.**
+>
+> Every one of these rejections goes through the existing `fail()` — HTTP **500** with the
+> error shape. A 400 would read as more correct and would be a protocol deviation.
+>
+> The Task 5 tests must also pin *pass-through fidelity* (the handler must not reshape
+> `solution`) rather than asserting fields on the mock's own fixture, which is tautological.
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -1448,10 +1489,43 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
 }
 ```
 
+> **Amended during Task 6 review.** The server code above is the starting shape and is missing
+> several things a long-running listener owes its caller:
+>
+> - **An oversized body must answer 500, not reset the connection.** `readBody`'s
+>   `req.destroy()` fires on the same tick as its reject, so the socket is gone before the
+>   catch can write — the client sees `ECONNRESET`. A transport error is a *worse* deviation
+>   than the 400 this design already forbids, because a FlareSolverr client degrades on a
+>   non-2xx but reads a reset as an availability failure. **Note:** deferring the destroy to
+>   `res.on('finish')` does NOT fix it — closing a socket that still has unread inbound data
+>   sends RST rather than FIN, and the RST discards the response. Answer, then *drain* a
+>   bounded remainder so the close is a FIN. This was measured, not reasoned.
+> - **Attach a permanent `error` listener after listen resolves.** `onListening` removes the
+>   startup handler, leaving the `net.Server` with zero `error` listeners; `net.Server` emits
+>   `error` on accept failure (`EMFILE`/`ENFILE` — realistic for a process that also spawns
+>   browsers) and an unhandled `error` event throws. The daemon dies instead of logging.
+> - **Guard the token check with `!cfg.token`, not `cfg.token === null`.** `timingSafeEqual`
+>   on two empty buffers returns `true`, so a config with `token: ''` would authenticate
+>   `Authorization: Bearer `. Unreachable via `loadConfig`, but this branch exists precisely
+>   so it does not depend on `loadConfig`.
+> - **Match the `Bearer` scheme case-insensitively** (RFC 7235), token case-sensitively.
+> - **Verify the resolved address after listen.** `GATEHOUSE_BIND=localhost` is treated as
+>   loopback while Node resolves it through DNS/hosts. Read `server.address()`; if it is not
+>   loopback and no token is set, close and refuse.
+> - **Emit the "8191 is FlareSolverr's own" sentence only when the port IS 8191**, or it
+>   misdirects an operator who set `GATEHOUSE_PORT=9000`.
+> - **Accept `HEAD` as well as `GET` on `/gh/health`** — monitoring probes use it.
+> - **Share the error-shape builder with `/v1`.** Export `fail` from `src/api/v1.ts` rather
+>   than hand-rolling the same object in `server.ts`, or the two drift silently.
+>
+> Test note: the two token tests must include a wrong token that is a strict **extension** of
+> the real one. With only different-length wrong tokens, the comparison can be weakened to
+> `startsWith` and the suite stays green.
+
 - [ ] **Step 5: Run the tests and confirm they pass**
 
 Run: `npx vitest run test/unit/server.test.ts`
-Expected: PASS, 8 tests
+Expected: PASS (the amendment above adds tests; the file lands at 14)
 
 - [ ] **Step 6: Commit**
 
@@ -1665,6 +1739,53 @@ export function makeSolver(pool: BrowserPool): Solver {
   };
 }
 ```
+
+> **Amended during Task 7 review — the `solve.ts` above contains a CRITICAL defect.**
+>
+> `session.webRequest.onHeadersReceived` is a **setter, not an emitter**: a second call
+> replaces the first, and the `null` overload clears the slot wholesale. But `BrowserPool`
+> only reuses windows sitting in the *free* list, so a second concurrent `acquire()` on the
+> same session builds a second window on the identical partition — and Electron caches one
+> `Session` per partition, so both solves share one `webRequest`.
+>
+> Result: solve B's registration **evicts** solve A's listener. A's `status` stays at its
+> initializer `0` and `headers` at `{}` forever. With no headers, `classify` loses the
+> `cf-mitigated: challenge` signal and falls through to HTML markers alone — so an
+> interstitial lacking `challenge-form`/`challenge-platform`/`cf_chl_opt` is judged **clear**,
+> and the interstitial HTML is returned to the caller as `solution.response`. **It fails
+> open.** Worse, whichever solve finishes first calls `onHeadersReceived(null)`, so the
+> survivor sees no headers for the rest of its solve — including the post-challenge redirect
+> chain, the one phase whose status matters.
+>
+> Reachable with the shipped defaults: `concurrency` is 2, `/v1` derives the session from the
+> hostname, and the dedupe key includes the URL — so two paths on one host are two concurrent
+> jobs on one session. That is the ordinary case for a FlareSolverr client.
+>
+> **Correct shape:** one refcounted listener per session, demultiplexing on
+> `details.webContentsId` into a per-`webContents` record; deregister only when the last solve
+> on that session releases. Cover it with an integration test issuing two concurrent requests
+> to different paths on one host.
+>
+> Also missing from the code above, all found in the same review:
+>
+> - **`maxTimeout` does not bound the navigation.** `await wc.loadURL(...)` runs before the
+>   deadline is ever consulted, so a host that accepts and then stalls pins a pool window and
+>   a queue slot forever. With `concurrency: 2`, two stalled hosts wedge the service
+>   permanently. Race the solve against the deadline.
+> - **`npm test` must build first.** `main` is `dist/main.js` and the harness spawns
+>   `electron .`, so bare `vitest run` tests whatever was compiled last — a green run against
+>   stale code, which is precisely the failure this integration design exists to prevent. Make
+>   the script `tsc && vitest run` AND have the harness refuse to run if `dist/main.js` is
+>   missing or older than the newest `src/**/*.ts`.
+> - **`solveTimeoutMs` is a dead knob** unless `main.ts` clamps the client-supplied
+>   `maxTimeout` to it.
+> - **`loadConfig` belongs inside the `try`**, or a `ConfigError` bypasses the `log.error` +
+>   `app.exit(1)` handler and the operator gets an unhandled-rejection dump instead of the
+>   sentence telling them what to set.
+> - `executeJavaScript(GRAB_HTML, true)` — the `true` is `userGesture`, an unnecessary grant
+>   to hostile page code. Use `false`.
+> - Read `win.webContents` and its session INSIDE the `try`, or a throw there skips `finally`,
+>   never releases the window, and permanently inflates `busy`.
 
 - [ ] **Step 3: Implement `src/main.ts`**
 

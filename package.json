@@ -1,0 +1,25 @@
+{
+  "name": "gatehouse",
+  "version": "1.0.0",
+  "description": "A browser-backed solver-proxy speaking the FlareSolverr protocol.",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "test": "tsc && vitest run",
+    "build": "tsc",
+    "start": "electron .",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "tsc && vitest run test/integration"
+  },
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "electron": "43.4.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
