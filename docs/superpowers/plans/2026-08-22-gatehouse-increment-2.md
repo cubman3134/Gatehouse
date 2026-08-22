@@ -931,6 +931,27 @@ export async function serveFile(
 >   `application/octet-stream`.
 > - **Set `content-length: 0` on the 416**, or it goes out chunked.
 >
+> **Second amendment — hand-rolled header sanitising was wrong twice; use Node's own predicate.**
+> A blacklist of `
+ ` still let 30 characters through that Node rejects: every C0 control
+> except HT/LF/CR/NUL, ``, and **every non-Latin-1 codepoint**. `content-type:
+> "application/zip; name=€.zip"` from an upstream server was `exit 1`. Likewise
+> `encodeURIComponent` throws `URIError` on a lone surrogate in a filename — same class, same
+> dead daemon.
+>
+> Run **every** outgoing header value through `validateHeaderValue` (from `node:http`) in a
+> try/catch immediately before `writeHead`, substituting a safe fallback and logging at warn.
+> That makes it impossible for any header value from any source to throw inside `writeHead`,
+> which is the property wanted — not a character list that has to be kept correct.
+>
+> Also: `pipeline` rejects `ERR_STREAM_UNABLE_TO_PIPE` **before** taking ownership of its
+> source, so a client abort landing while `fs.open` is in flight leaks the read stream unless
+> the catch destroys it explicitly. Measured at 116 leaked descriptors per 200 aborts.
+>
+> And distinguish `ERR_STREAM_PREMATURE_CLOSE` (a real client hang-up → warn) from every other
+> stream failure (→ error). Otherwise an EISDIR or a revoked permission logs as a routine
+> cancel, which is exactly the line someone will trust at 3am.
+
 > Test note: the injection test must assert the **encoded form** (`toContain('%0D%0A')`), not
 > read headers back through an HTTP parser that could never surface a smuggled header anyway.
 > The original assertions passed against a mutant that stripped CR/LF instead of encoding it,
