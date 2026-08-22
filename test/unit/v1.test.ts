@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { handleV1, type Solution, type V1Deps } from '../../src/api/v1.js';
+import { handleV1, SESSION_NAME, type Solution, type V1Deps } from '../../src/api/v1.js';
+
+/** A clock that never repeats, so a swapped or mistimed timestamp pair cannot hide. */
+const tickingClock = () => {
+  let t = 0;
+  return () => (t += 1000);
+};
 
 const solution: Solution = {
   url: 'http://example.test/',
@@ -86,7 +92,9 @@ describe('handleV1', () => {
     expect(httpStatus).toBe(500);
     expect((body as any).status).toBe('error');
     expect((body as any).message).toMatch(/nonsense/);
-    expect((body as any).solution).toBeUndefined();
+    // `toBeUndefined` would also pass for `{ solution: undefined }`, which serializes to a
+    // present key. FlareSolverr's error shape has no `solution` key at all.
+    expect('solution' in (body as any)).toBe(false);
   });
 
   it('returns 500 for a missing url', async () => {
@@ -106,5 +114,179 @@ describe('handleV1', () => {
 
     expect(httpStatus).toBe(500);
     expect((body as any).message).toMatch(/challenge never cleared/);
+  });
+
+  // The handler names no field of `solution` at runtime — it forwards whatever the solver
+  // returned. That pass-through is the contract, so pin it against any future reshaping.
+  it('returns the solver\'s solution byte-for-byte', async () => {
+    const odd = {
+      url: 'https://exämple.test/path?q=%20&b=1#frag',
+      status: 503,
+      headers: { 'set-cookie': 'a=1, b=2', 'x-empty': '' },
+      cookies: [
+        { name: 'cf_clearance', value: 'a.b-c_d~e', domain: '.example.test', path: '/', expires: -1, httpOnly: true, secure: true },
+        { name: '', value: '', domain: '', path: '', expires: 0, httpOnly: false, secure: false },
+      ],
+      userAgent: 'Mozilla/5.0 «weird» Chrome/120',
+      response: '<html>\n\t<body>ünïcode &amp; \u0000 </body>\n</html>',
+    } as unknown as Solution;
+
+    const { body } = await handleV1(
+      { cmd: 'request.get', url: 'http://example.test/' },
+      deps({ solve: vi.fn(async () => odd) }),
+    );
+    const r = body as any;
+
+    expect(r.solution).toEqual(odd);
+    expect(Object.keys(r)).toEqual(['status', 'message', 'startTimestamp', 'endTimestamp', 'version', 'solution']);
+  });
+
+  it('stamps a success end-timestamp after its start-timestamp', async () => {
+    const { body } = await handleV1(
+      { cmd: 'request.get', url: 'http://example.test/' },
+      deps({ now: tickingClock() }),
+    );
+    const r = body as any;
+
+    expect(r.endTimestamp).toBeGreaterThan(r.startTimestamp);
+  });
+
+  it('stamps an error end-timestamp after its start-timestamp', async () => {
+    const { body } = await handleV1({ cmd: 'nonsense' }, deps({ now: tickingClock() }));
+    const r = body as any;
+
+    expect(r.endTimestamp).toBeGreaterThan(r.startTimestamp);
+  });
+
+  describe('url scheme allow-list', () => {
+    // Without this, `solution.response` is the contents of the file, returned over HTTP.
+    it('refuses a file: url and never reaches the solver', async () => {
+      const solve = vi.fn(async () => solution);
+      const { httpStatus, body } = await handleV1(
+        { cmd: 'request.get', url: 'file:///C:/Users/you/.ssh/id_rsa' },
+        deps({ solve }),
+      );
+
+      expect(httpStatus).toBe(500);
+      expect((body as any).status).toBe('error');
+      expect((body as any).message).toMatch(/file:/);
+      expect('solution' in (body as any)).toBe(false);
+      expect(solve).not.toHaveBeenCalled();
+    });
+
+    // A host-less URL parses fine, so this is caught by the scheme check, not by anything
+    // in session derivation.
+    it('refuses a mailto: url before session derivation matters', async () => {
+      const solve = vi.fn(async () => solution);
+      const { httpStatus, body } = await handleV1(
+        { cmd: 'request.get', url: 'mailto:someone@example.test' },
+        deps({ solve }),
+      );
+
+      expect(httpStatus).toBe(500);
+      expect((body as any).message).toMatch(/mailto:/);
+      expect(solve).not.toHaveBeenCalled();
+    });
+
+    it('refuses a url that does not parse', async () => {
+      const solve = vi.fn(async () => solution);
+      const { httpStatus, body } = await handleV1(
+        { cmd: 'request.get', url: 'not a url at all' },
+        deps({ solve }),
+      );
+
+      expect(httpStatus).toBe(500);
+      expect((body as any).message).toMatch(/not a valid URL/);
+      expect(solve).not.toHaveBeenCalled();
+    });
+
+    it('still accepts https', async () => {
+      const solve = vi.fn(async () => solution);
+      const { httpStatus } = await handleV1({ cmd: 'request.get', url: 'https://example.test/' }, deps({ solve }));
+
+      expect(httpStatus).toBe(200);
+      expect(solve).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://example.test/' }));
+    });
+  });
+
+  describe('session names', () => {
+    // `persist:<session>` becomes a directory. These are the shapes that walk out of it.
+    const rejected: Array<[string, string]> = [
+      ['a traversal', '../../../../etc'],
+      ['a backslash', 'vimm\\..\\..\\etc'],
+      ['a bare dot-dot', '..'],
+      ['a single dot', '.'],
+      ['a colon', 'c:evil'],
+      ['65 characters', 'a'.repeat(65)],
+    ];
+
+    for (const [label, bad] of rejected) {
+      it(`refuses a caller session with ${label}`, async () => {
+        const solve = vi.fn(async () => solution);
+        const { httpStatus, body } = await handleV1(
+          { cmd: 'request.get', url: 'http://example.test/', session: bad },
+          deps({ solve }),
+        );
+
+        expect(httpStatus).toBe(500);
+        expect((body as any).status).toBe('error');
+        expect((body as any).message).toContain(bad);
+        expect('solution' in (body as any)).toBe(false);
+        expect(solve).not.toHaveBeenCalled();
+      });
+    }
+
+    it('accepts a 64-character session, the last legal length', async () => {
+      const solve = vi.fn(async () => solution);
+      const name = 'a'.repeat(64);
+      const { httpStatus } = await handleV1(
+        { cmd: 'request.get', url: 'http://example.test/', session: name },
+        deps({ solve }),
+      );
+
+      expect(httpStatus).toBe(200);
+      expect(solve).toHaveBeenCalledWith(expect.objectContaining({ session: name }));
+    });
+
+    it('refuses the same names on sessions.create and sessions.destroy', async () => {
+      const d = deps();
+      for (const [, bad] of rejected) {
+        expect((await handleV1({ cmd: 'sessions.create', session: bad }, d)).httpStatus).toBe(500);
+        expect((await handleV1({ cmd: 'sessions.destroy', session: bad }, d)).httpStatus).toBe(500);
+      }
+      expect([...d.sessions]).toEqual([]);
+    });
+
+    // Derived names are sanitized, not rejected — the caller never chose them. An IPv6
+    // literal arrives as `[::1]`, and brackets and colons are not legal path components.
+    it('sanitizes a derived session from an IPv6 host', async () => {
+      const solve = vi.fn(async () => solution);
+      await handleV1({ cmd: 'request.get', url: 'http://[::1]:8080/' }, deps({ solve }));
+
+      const derived = (solve.mock.calls[0] as any)[0].session as string;
+      expect(derived).toBe('---1-');
+      expect(SESSION_NAME.test(derived)).toBe(true);
+    });
+
+    it('lowercases and keeps an ordinary derived host', async () => {
+      const solve = vi.fn(async () => solution);
+      await handleV1({ cmd: 'request.get', url: 'http://Example.TEST/' }, deps({ solve }));
+
+      expect(solve).toHaveBeenCalledWith(expect.objectContaining({ session: 'example.test' }));
+    });
+  });
+
+  it('clamps maxTimeout to five minutes', async () => {
+    const solve = vi.fn(async () => solution);
+    await handleV1({ cmd: 'request.get', url: 'http://example.test/', maxTimeout: 86_400_000 }, deps({ solve }));
+
+    expect(solve).toHaveBeenCalledWith(expect.objectContaining({ maxTimeout: 300_000 }));
+  });
+
+  it('leaves a maxTimeout under the clamp alone', async () => {
+    const solve = vi.fn(async () => solution);
+    await handleV1({ cmd: 'request.get', url: 'http://example.test/', maxTimeout: 70_000 }, deps({ solve }));
+
+    expect(solve).toHaveBeenCalledWith(expect.objectContaining({ maxTimeout: 70_000 }));
   });
 });

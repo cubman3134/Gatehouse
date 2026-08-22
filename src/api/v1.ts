@@ -35,14 +35,49 @@ export interface V1Deps {
 }
 
 const DEFAULT_MAX_TIMEOUT = 60_000;
+const MAX_MAX_TIMEOUT = 300_000;
+const MAX_SESSION_LENGTH = 64;
+
+/**
+ * A session name becomes a Chromium partition (`persist:<session>`) and from there a
+ * directory on disk, so it is restricted to characters that cannot walk out of it.
+ */
+export const SESSION_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** `.` and `..` clear the charset but are filesystem specials, not names. */
+function allDots(value: string): boolean {
+  return /^\.+$/.test(value);
+}
+
+/** A caller-supplied session is accepted verbatim or not at all. */
+function validSession(value: string): boolean {
+  return SESSION_NAME.test(value) && !allDots(value);
+}
+
+/** The value is echoed because the caller sent it; it is a partition label, not a secret. */
+function badSession(value: string): string {
+  return `session must match ${SESSION_NAME.source} and not be all dots: ${value}`;
+}
+
+/**
+ * A derived session is sanitized rather than rejected — the caller did not choose it, and
+ * hosts legitimately carry characters a path cannot (an IPv6 literal arrives as `[::1]`).
+ */
+function sanitizeSession(host: string): string {
+  const cleaned = host.toLowerCase().replace(/[^a-z0-9.-]/g, '-').slice(0, MAX_SESSION_LENGTH);
+  return !cleaned || allDots(cleaned) ? 'default' : cleaned;
+}
 
 /** Session name derived from a URL when the caller supplies none. */
 function sessionFor(url: string): string {
+  let hostname: string;
   try {
-    return new URL(url).hostname;
+    hostname = new URL(url).hostname;
   } catch {
     return 'default';
   }
+  // `mailto:`, `data:`, `about:` and friends parse cleanly with no host at all.
+  return hostname ? sanitizeSession(hostname) : 'default';
 }
 
 function ok(deps: V1Deps, startTimestamp: number, extra: Record<string, unknown>) {
@@ -91,7 +126,11 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
 
   switch (cmd) {
     case 'sessions.create': {
-      const session = typeof req.session === 'string' && req.session ? req.session : 'default';
+      const supplied = typeof req.session === 'string' && req.session ? req.session : '';
+      if (supplied && !validSession(supplied)) {
+        return fail(deps, startTimestamp, badSession(supplied));
+      }
+      const session = supplied || 'default';
       deps.sessions.add(session);
       return ok(deps, startTimestamp, { session });
     }
@@ -99,6 +138,9 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
       return ok(deps, startTimestamp, { sessions: [...deps.sessions] });
     case 'sessions.destroy': {
       const session = typeof req.session === 'string' ? req.session : '';
+      if (session && !validSession(session)) {
+        return fail(deps, startTimestamp, badSession(session));
+      }
       deps.sessions.delete(session);
       return ok(deps, startTimestamp, {});
     }
@@ -107,11 +149,33 @@ export async function handleV1(body: unknown, deps: V1Deps): Promise<{ httpStatu
       const url = typeof req.url === 'string' ? req.url : '';
       if (!url) return fail(deps, startTimestamp, 'url is required for ' + cmd);
 
-      const maxTimeout =
+      // The URL is handed to a real browser. Without a scheme allow-list, `file:` turns this
+      // into an arbitrary local-file reader that answers over the wire.
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return fail(deps, startTimestamp, `url is not a valid URL: ${url}`);
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return fail(
+          deps,
+          startTimestamp,
+          `url scheme ${parsed.protocol} is not supported; only http and https are`,
+        );
+      }
+
+      const suppliedSession = typeof req.session === 'string' && req.session ? req.session : '';
+      if (suppliedSession && !validSession(suppliedSession)) {
+        return fail(deps, startTimestamp, badSession(suppliedSession));
+      }
+
+      const requested =
         typeof req.maxTimeout === 'number' && Number.isFinite(req.maxTimeout) && req.maxTimeout > 0
           ? req.maxTimeout
           : DEFAULT_MAX_TIMEOUT;
-      const session = typeof req.session === 'string' && req.session ? req.session : sessionFor(url);
+      const maxTimeout = Math.min(requested, MAX_MAX_TIMEOUT);
+      const session = suppliedSession || sessionFor(url);
       const postData = cmd === 'request.post' && typeof req.postData === 'string' ? req.postData : undefined;
 
       try {
