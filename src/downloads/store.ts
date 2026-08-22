@@ -37,8 +37,14 @@ export class DownloadStore {
   nowMs(): number { return this.opts.now(); }
 
   /** `<id>.part` while transferring, `<id>.bin` once complete. Never a remote-supplied name. */
-  partPath(id: string): string { return join(this.opts.dir, `${id}.part`); }
-  filePath(id: string): string { return join(this.opts.dir, `${id}.bin`); }
+  partPath(id: string): string {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`invalid id: ${id}`);
+    return join(this.opts.dir, `${id}.part`);
+  }
+  filePath(id: string): string {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`invalid id: ${id}`);
+    return join(this.opts.dir, `${id}.bin`);
+  }
 
   async load(): Promise<void> {
     await mkdir(this.opts.dir, { recursive: true });
@@ -55,7 +61,7 @@ export class DownloadStore {
         if (r && typeof r.id === 'string') {
           // Nothing can be mid-transfer across a restart: the process that owned it is gone.
           // Demote so a stale `running` cannot block dedupe or survive a sweep forever.
-          this.records.set(r.id, isSettled(r.state) ? r : { ...r, state: 'failed', error: { code: 'cancelled', message: 'interrupted by a restart' } });
+          this.records.set(r.id, isSettled(r.state) ? r : { ...r, state: 'failed', error: { code: 'cancelled', message: 'interrupted by a restart' }, completedAt: this.opts.now() });
         }
       }
     } catch (e: unknown) {
@@ -137,8 +143,9 @@ export class DownloadStore {
       if (!isReclaimable(r)) continue;
       const since = r.completedAt ?? r.createdAt;
       if (now - since > this.opts.ttlMs) {
-        await this.remove(r.id);
-        removed.push(r.id);
+        if (await this.remove(r.id)) {
+          removed.push(r.id);
+        }
       }
     }
 
@@ -154,9 +161,10 @@ export class DownloadStore {
 
     for (const v of victims) {
       if (total <= this.opts.maxBytes) break;
-      await this.remove(v.r.id);
-      removed.push(v.r.id);
-      total -= v.bytes;
+      if (await this.remove(v.r.id)) {
+        removed.push(v.r.id);
+        total -= v.bytes;
+      }
     }
     return removed;
   }
@@ -172,7 +180,8 @@ export class DownloadStore {
   /**
    * Atomic: write a sibling tmp then rename over the manifest, so a crash mid-write leaves the
    * previous manifest intact rather than a truncated one. Serialised through `writing` because
-   * concurrent transfers update progress from several places at once.
+   * concurrent transfers update progress from several places at once. Persistence is best-effort;
+   * a write failure is logged but does not stop the daemon, degrading the store to in-memory only.
    */
   private save(): Promise<void> {
     this.writing = this.writing.then(async () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DownloadStore } from '../../src/downloads/store.js';
@@ -120,12 +120,72 @@ describe('DownloadStore', () => {
     expect(s.get(a.id)?.lastAccessAt).toBe(7777);
   });
 
-  it('writes the manifest atomically, leaving no tmp file behind', async () => {
+  it('writes a manifest that parses and leaves no tmp behind', async () => {
     const s = mk(); await s.load();
     await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
     const files = await readdir(dir);
     expect(files).toContain('manifest.json');
     expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
     JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')); // must parse
+  });
+
+  it('writes the manifest atomically', async () => {
+    const s = mk(); await s.load();
+    await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
+
+    const p = join(dir, 'manifest.json');
+    const before = await stat(p);
+    await s.create({ url: 'http://x.test/b', session: 'x.test', referer: null });
+    const after = await stat(p);
+
+    // A rename swaps in a different file object; an in-place write would keep the same one.
+    // This is what proves save() is tmp-then-rename rather than a truncating overwrite.
+    expect(after.ino).not.toBe(before.ino);
+  });
+
+  it('demotes a running record to failed on restart', async () => {
+    // Simulate a manifest with a running record that was interrupted
+    await writeFile(
+      join(dir, 'manifest.json'),
+      JSON.stringify([
+        {
+          id: 'd1',
+          url: 'http://x.test/a',
+          session: 'x.test',
+          referer: null,
+          suggestedName: null,
+          contentType: null,
+          size: -1,
+          received: 0,
+          sha256: null,
+          state: 'running',
+          createdAt: 1000,
+          completedAt: null,
+          lastAccessAt: 1000,
+        },
+      ]),
+      'utf8',
+    );
+
+    const s = mk(); await s.load();
+    const r = s.get('d1');
+    expect(r?.state).toBe('failed');
+    expect(r?.error?.code).toBe('cancelled');
+    expect(r?.completedAt).not.toBeNull();
+    expect(s.findOpen('x.test', 'http://x.test/a')).toBeUndefined();
+  });
+
+  it('rejects invalid ids in filePath', async () => {
+    const s = mk(); await s.load();
+    expect(() => s.filePath('../../x')).toThrow();
+    expect(() => s.filePath('..')).toThrow();
+    expect(() => s.filePath('d1')).not.toThrow();
+  });
+
+  it('rejects invalid ids in partPath', async () => {
+    const s = mk(); await s.load();
+    expect(() => s.partPath('../../x')).toThrow();
+    expect(() => s.partPath('..')).toThrow();
+    expect(() => s.partPath('d1')).not.toThrow();
   });
 });
