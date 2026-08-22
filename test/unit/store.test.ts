@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile, readFile, readdir, stat } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DownloadStore } from '../../src/downloads/store.js';
+import type { DownloadRecord } from '../../src/downloads/record.js';
 import { log } from '../../src/log.js';
 
 let dir: string;
@@ -40,6 +41,76 @@ describe('DownloadStore', () => {
     const a = await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
     await s.update(a.id, { state: 'failed' });
     expect(s.findOpen('x.test', 'http://x.test/a')).toBeUndefined();
+  });
+
+  describe('findResumable', () => {
+    // Set up one settled-failed record for `url` with the given failure and, unless told
+    // otherwise, a surviving partial.
+    const failedWith = async (
+      s: DownloadStore,
+      error: NonNullable<DownloadRecord['error']>,
+      opts: { partial?: boolean; url?: string; state?: 'failed' | 'cancelled' } = {},
+    ) => {
+      const url = opts.url ?? 'http://x.test/a';
+      const r = await s.create({ url, session: 'x.test', referer: null });
+      if (opts.partial !== false) await writeFile(s.partPath(r.id), 'half a file');
+      await s.update(r.id, { state: opts.state ?? 'failed', error, completedAt: clock });
+      return r;
+    };
+
+    it('reclaims a transiently-failed record whose partial survived', async () => {
+      const s = mk(); await s.load();
+      const r = await failedWith(s, { code: 'network', message: 'connection reset' });
+      expect((await s.findResumable('x.test', 'http://x.test/a'))?.id).toBe(r.id);
+    });
+
+    // Retrying these hits the same wall every time, so they are left alone and a fresh POST
+    // gets a fresh id.
+    it('refuses a permanent failure', async () => {
+      for (const code of ['http-error', 'disk-full'] as const) {
+        const s = mk(); await s.load();
+        await failedWith(s, { code, message: 'no' });
+        expect(await s.findResumable('x.test', 'http://x.test/a'), code).toBeUndefined();
+      }
+    });
+
+    // The caller asked for it to stop and its partial is gone; folding a later request onto it
+    // would resurrect something the caller retired.
+    it('refuses a cancelled record', async () => {
+      const s = mk(); await s.load();
+      await failedWith(s, { code: 'cancelled', message: 'cancelled by the caller' }, { state: 'cancelled' });
+      expect(await s.findResumable('x.test', 'http://x.test/a')).toBeUndefined();
+    });
+
+    // `load()`'s restart demotion carries code `cancelled`. That one belongs to
+    // `requeueInterrupted`, at startup, not to a re-POST.
+    it('refuses a record demoted by a restart', async () => {
+      const s = mk(); await s.load();
+      await failedWith(s, { code: 'cancelled', message: 'interrupted by a restart' });
+      expect(await s.findResumable('x.test', 'http://x.test/a')).toBeUndefined();
+    });
+
+    it('refuses a record with no partial left to resume from', async () => {
+      const s = mk(); await s.load();
+      await failedWith(s, { code: 'network', message: 'reset' }, { partial: false });
+      expect(await s.findResumable('x.test', 'http://x.test/a')).toBeUndefined();
+    });
+
+    it('does not cross sessions or urls', async () => {
+      const s = mk(); await s.load();
+      await failedWith(s, { code: 'network', message: 'reset' });
+      expect(await s.findResumable('other', 'http://x.test/a')).toBeUndefined();
+      expect(await s.findResumable('x.test', 'http://x.test/b')).toBeUndefined();
+    });
+
+    // Repeated failures leave several candidates. The newest has the furthest partial.
+    it('prefers the most recent candidate', async () => {
+      const s = mk(); await s.load();
+      await failedWith(s, { code: 'network', message: 'reset' });
+      clock = 9000;
+      const newer = await failedWith(s, { code: 'network', message: 'reset' });
+      expect((await s.findResumable('x.test', 'http://x.test/a'))?.id).toBe(newer.id);
+    });
   });
 
   it('survives a reload from the manifest', async () => {

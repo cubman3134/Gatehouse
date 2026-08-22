@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, readFile, writeFile, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, writeFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { DownloadStore } from '../../src/downloads/store.js';
 import type { DownloadRecord } from '../../src/downloads/record.js';
-import { transfer, nodeRequester } from '../../src/downloads/transfer.js';
+import { transfer, nodeRequester, STALLED } from '../../src/downloads/transfer.js';
 import { startFileHost, type FileHost } from '../fixture/filehost.js';
 
 let dir: string; let host: FileHost | undefined; let n = 0;
@@ -112,6 +112,104 @@ describe('transfer', () => {
     expect(rec.error?.message).toMatch(/206 from byte 5/);
     // Nothing was written: no finished file, and the record is not `done`.
     await expect(stat(s.filePath(r.id))).rejects.toThrow();
+  });
+
+  // A 206 that honours `bytes=N-` but omits `content-range` — RFC 9110 requires the header,
+  // sloppy proxies drop it — is sending the TAIL. Falling through to "the range was ignored,
+  // restart from zero" writes that tail as if it were the whole file: `total` is `0 + declared`
+  // so the length check passes, and the record settles `done` with a valid-looking sha256 of
+  // the wrong bytes. Same silent-corruption class as the third-offset case, other direction.
+  it('refuses a 206 that answers a resume with no content-range', async () => {
+    host = await startFileHost({ mode: 'headerless-206' });
+    const s = mkStore(); await s.load();
+    const r = await s.create({ url: host.url, session: 'h', referer: null });
+    await writeFile(s.partPath(r.id), BODY.subarray(0, 10));
+
+    await transfer(r.id, s, nodeRequester, new AbortController().signal);
+
+    expect(host.requests[0]?.range).toBe('bytes=10-'); // it really was asked to resume
+    const rec = s.get(r.id)!;
+    expect(rec.state).toBe('failed');
+    expect(rec.error?.code).toBe('http-error');
+    expect(rec.error?.message).toMatch(/no readable content-range/);
+    // Nothing was finalised, and above all nothing was hashed as if it were the whole file.
+    expect(rec.sha256).toBeNull();
+    await expect(stat(s.filePath(r.id))).rejects.toThrow();
+  });
+
+  // Same fixture with NO partial to resume from is not the same request: we asked for nothing,
+  // so a 206 carrying the whole body is just a body, and the refusal must not fire.
+  it('accepts a 206 with no content-range when nothing was asked for', async () => {
+    host = await startFileHost({ mode: 'headerless-206' });
+    const s = mkStore(); await s.load();
+    const r = await s.create({ url: host.url, session: 'h', referer: null });
+
+    await transfer(r.id, s, nodeRequester, new AbortController().signal);
+
+    expect(s.get(r.id)?.state).toBe('done');
+    expect(s.get(r.id)?.sha256).toBe(SHA);
+  });
+
+  // A stall is not a cancel. The watchdog in `main.ts` aborts with STALLED when a host goes
+  // quiet; discarding the partial and reporting `cancelled` would bin a nearly-complete
+  // download and blame a caller that did nothing.
+  it('keeps the partial and fails with `network` when the abort reason is STALLED', async () => {
+    host = await startFileHost({ mode: 'stall' });
+    const s = mkStore(); await s.load();
+    const r = await s.create({ url: host.url, session: 'h', referer: null });
+
+    const ac = new AbortController();
+    const p = transfer(r.id, s, nodeRequester, ac.signal);
+    await new Promise((res) => setTimeout(res, 150));
+    ac.abort(STALLED);
+    await p;
+
+    const rec = s.get(r.id)!;
+    expect(rec.state).toBe('failed');
+    expect(rec.error?.code).toBe('network');
+    expect(rec.error?.message).toMatch(/stall/i);
+    expect((await stat(s.partPath(r.id))).size).toBeGreaterThan(0); // kept, for the resume
+  });
+
+  // The sweep ages a record from `completedAt ?? createdAt`. Without the stamp, a transfer that
+  // ran for hours before failing is reclaimable almost at once — taking the partial with it.
+  it('stamps completedAt on a failure and on a cancel', async () => {
+    host = await startFileHost({ mode: 'truncate' });
+    const s = mkStore(); await s.load(); // the injected clock is a constant 1000
+    const failed = await s.create({ url: host.url, session: 'h', referer: null });
+    await transfer(failed.id, s, nodeRequester, new AbortController().signal);
+    expect(s.get(failed.id)?.state).toBe('failed');
+    expect(s.get(failed.id)?.completedAt).toBe(1000);
+    await host.close();
+
+    host = await startFileHost({ mode: 'stall' });
+    const cancelled = await s.create({ url: host.url, session: 'h', referer: null });
+    const ac = new AbortController();
+    const p = transfer(cancelled.id, s, nodeRequester, ac.signal);
+    await new Promise((res) => setTimeout(res, 150));
+    ac.abort();
+    await p;
+    expect(s.get(cancelled.id)?.state).toBe('cancelled');
+    expect(s.get(cancelled.id)?.completedAt).toBe(1000);
+  });
+
+  // `transfer` promises never to reject, and the unlink on the cancel path is where that used
+  // to break: `rm`'s `force` suppresses ENOENT only, so an EPERM from a scanner holding the
+  // file rejected straight out — leaving the record unsettled forever, which wedges the dedupe
+  // key until a restart.
+  it('does not reject when the partial cannot be unlinked on a cancel', async () => {
+    host = await startFileHost({ mode: 'stall' });
+    const s = mkStore(); await s.load();
+    const r = await s.create({ url: host.url, session: 'h', referer: null });
+
+    const ac = new AbortController();
+    ac.abort(); // cancelled before we dial: this settle runs OUTSIDE the try/catch
+    // A directory where the `.part` should be. `rm` without `recursive` refuses it, which is
+    // the same shape of unlink failure as a scanner's EPERM without needing a real scanner.
+    await mkdir(s.partPath(r.id), { recursive: true });
+
+    await expect(transfer(r.id, s, nodeRequester, ac.signal)).resolves.toBeUndefined();
+    expect(s.get(r.id)?.state).toBe('cancelled');
   });
 
   it('records an http-error for a non-2xx and writes no file', async () => {

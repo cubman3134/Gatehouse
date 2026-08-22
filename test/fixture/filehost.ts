@@ -23,8 +23,14 @@ export interface FileHostOptions {
    * 'lying-206'  — answers a ranged request with 206 but a content-range of `bytes 0-n-1/n`
    *                and the whole body, the way some proxies and CDNs do. Appending that to a
    *                partial is exactly the silent corruption the transfer guard exists to stop.
+   * 'headerless-206' — HONOURS the range (sends only the tail) with a 206, but omits
+   *                `content-range` entirely. RFC 9110 requires the header; sloppy proxies drop
+   *                it anyway. Nothing in the response says where the body starts, so treating
+   *                it as "the range was ignored" and restarting from zero would write the tail
+   *                as if it were the whole file — a `done` record with a valid-looking sha256
+   *                of the wrong bytes.
    */
-  mode?: 'range' | 'no-range' | 'truncate' | 'stall' | 'chunked' | 'no-headers' | 'lying-206' | 'shifted-206';
+  mode?: 'range' | 'no-range' | 'truncate' | 'stall' | 'chunked' | 'no-headers' | 'lying-206' | 'shifted-206' | 'headerless-206';
   body?: Buffer;
   filename?: string;
 }
@@ -73,6 +79,17 @@ export async function startFileHost(opts: FileHostOptions = {}): Promise<FileHos
         'content-length': String(body.length - from),
       });
       res.end(body.subarray(from));
+      return;
+    }
+
+    if (mode === 'headerless-206') {
+      // Deliberately the COMPLIANT-but-headerless case: the range really is honoured, so the
+      // body is the tail and nothing but the missing header makes it unplaceable.
+      const m = /^bytes=(\d+)-$/.exec(req.headers.range ?? '');
+      const from = m ? Number(m[1]) : 0;
+      const slice = body.subarray(from);
+      res.writeHead(206, { ...common, 'content-length': String(slice.length) });
+      res.end(slice);
       return;
     }
 

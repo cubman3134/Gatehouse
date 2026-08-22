@@ -243,11 +243,14 @@ describe('downloading through the real app', () => {
       expect((await state(silent)).state).toBe('running');
       expect((await state(behind)).state).toBe('queued');
 
-      // The watchdog aborts; `transfer`'s own cancel path is what settles the record, which is
-      // why the message reads as a caller cancel — it is handed a signal, not a reason.
+      // The watchdog aborts, and it aborts WITH A REASON. `transfer` reads it off
+      // `signal.reason` and settles a stall as the retryable host fault it is — `failed` /
+      // `network` — rather than as `cancelled`, which would report the caller's own action back
+      // to a caller that did nothing. Still one settle site; only the reason crossed.
       const stalled = await settleWithin(silent, 20_000);
-      expect(stalled.state).toBe('cancelled');
-      expect(stalled.error!.code).toBe('cancelled');
+      expect(stalled.state).toBe('failed');
+      expect(stalled.error!.code).toBe('network');
+      expect(stalled.error!.message).toMatch(/stall/i);
 
       // The slot really was freed: the job behind it ran, and ran to completion.
       const next = await settleWithin(behind, 20_000);

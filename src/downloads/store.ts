@@ -107,6 +107,45 @@ export class DownloadStore {
     return undefined;
   }
 
+  /**
+   * A settled-`failed` record for this exact target that a fresh request may TAKE OVER instead
+   * of minting a new id — or undefined, which means "start a new download".
+   *
+   * Without this, `transfer`'s promise that a failure keeps its partial is one the system
+   * cannot keep. `findOpen` refuses a settled record, so a re-POST after a mid-body drop mints
+   * a new id and a new `.part`, the kept bytes are orphaned disk until the sweep, and a 40GB
+   * download restarts from zero after a blip. The only other caller of the resume path is
+   * `requeueInterrupted`, which fires once at startup and by design refuses real failures.
+   *
+   * All four conditions matter:
+   *
+   *   - `failed`, never `cancelled`. The caller asked for a cancel and its partial is already
+   *     gone; folding a later request onto that record would resurrect something it retired.
+   *   - code `network`, never `http-error` or `disk-full`. Those are permanent as far as we can
+   *     tell — a 404, a refused 206, a full disk — and a retry just hits the same wall. This is
+   *     also what excludes `load()`'s restart demotion, which carries `cancelled`: that one is
+   *     `requeueInterrupted`'s to handle, at startup, and it is not this path's business.
+   *   - the `.part` must still exist and be non-empty, or there is nothing to resume FROM and
+   *     the reclaim buys nothing over a fresh id.
+   *   - same session and same url, because that is what makes it the same download.
+   *
+   * The newest candidate wins, so a target that failed repeatedly resumes from the furthest
+   * partial rather than an older, shorter one. The caller must set the record back to `queued`
+   * before it yields: an unsettled record is what makes `findOpen` fold the *next* request onto
+   * this same job rather than reclaiming it a second time.
+   */
+  async findResumable(session: string, url: string): Promise<DownloadRecord | undefined> {
+    const candidates = [...this.records.values()]
+      .filter((r) => r.state === 'failed' && r.session === session && r.url === url && r.error?.code === 'network')
+      .sort((a, b) => (b.completedAt ?? b.createdAt) - (a.completedAt ?? a.createdAt));
+    for (const r of candidates) {
+      try {
+        if ((await stat(this.partPath(r.id))).size > 0) return r;
+      } catch { /* no partial: nothing to resume from */ }
+    }
+    return undefined;
+  }
+
   async create(init: DownloadInit): Promise<DownloadRecord> {
     const t = this.opts.now();
     const rec: DownloadRecord = {

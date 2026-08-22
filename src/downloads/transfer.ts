@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { DownloadStore } from './store.js';
-import type { FailureCode } from './record.js';
+import type { DownloadRecord, FailureCode } from './record.js';
 import { log } from '../log.js';
 
 export interface TransferResponse {
@@ -28,6 +28,31 @@ export type Requester = (req: {
 
 /** Persisting progress means an fsync, so only report every few megabytes. */
 export const PROGRESS_BYTES = 4 * 1024 * 1024;
+
+/**
+ * The abort reason that means "this transfer stopped moving", as against "the caller asked for
+ * it to stop". `main.ts`'s idle watchdog aborts with THIS value; `transfer` reads it back off
+ * `signal.reason` and settles accordingly.
+ *
+ * The two outcomes are genuinely different and must not share a terminal state. A caller's
+ * cancel is the caller's own doing and its bytes are unwanted, so the partial is deleted and
+ * the record reads `cancelled`. A stall is a retryable HOST fault the caller never asked for:
+ * discarding 95% of a 40GB file because the far end went quiet is the expensive mistake, and
+ * reporting `cancelled` to a caller that cancelled nothing is a lie about who acted.
+ *
+ * A symbol, exported, rather than a sentinel string: only code that imports this binding can
+ * produce a value that compares equal to it, so a caller's own `abort('stalled')` is still an
+ * ordinary cancel — and neither side can drift by rewording a literal. It is *not* a second
+ * settle site: the watchdog still only aborts, and `transfer` remains the only writer of a
+ * terminal state, per the invariant in `record.ts`.
+ */
+export const STALLED = Symbol('gatehouse:download-stalled');
+
+/**
+ * What a stall-abandoned record says. The log line names the id and the window; this is what a
+ * consumer polling `/gh/jobs/:id` reads, so it has to name the stall on its own.
+ */
+const STALL_MESSAGE = 'the host stopped sending; abandoned after the idle stall window';
 
 function coded(code: FailureCode, message: string): { code: FailureCode; message: string } {
   return { code, message };
@@ -129,18 +154,33 @@ function drained(out: WriteStream): Promise<void> {
  *
  * Resume: if a partial exists we ask for `bytes=N-`. Appending is allowed only when the server
  * both answers 206 **and** its `content-range` starts at exactly the byte we asked for. A 200
- * means it ignored us and is sending from zero; a 206 whose `content-range` is missing,
- * unreadable, or points somewhere else means it is not sending what we asked for either — and
- * proxies and CDNs do both. In every one of those cases the partial is discarded, because
- * appending would silently corrupt the file, and a corrupt multi-GB ISO is expensive to
+ * means it ignored us and is sending from zero, so the partial is discarded and we start over.
+ * A 206 that points somewhere else, or that carries no readable `content-range` at all, is
+ * REFUSED outright — it cannot be placed in either direction, and proxies and CDNs produce
+ * both. Appending would silently corrupt the file, and a corrupt multi-GB ISO is expensive to
  * discover. The status code alone is not evidence.
  *
  * Hashing happens in a final pass over the finished file rather than while streaming. Streaming
  * cannot carry a partial hash across a process restart, and one extra local read is cheaper
  * than a hash that is wrong after a resume.
  *
- * Never rejects: this is driven from a long-running daemon, and every outcome is recorded on
- * the record instead of thrown at a caller that may not be awaiting it.
+ * **Never rejects.** This is driven from a long-running daemon whose call site is `void`ed, so
+ * a rejection here is an unhandled one — and, worse, a record left unsettled forever: `findOpen`
+ * would then fold every re-POST for that target onto a job nothing is running, with no watchdog
+ * left to free it, until the process restarts. Three things make the promise true, and all three
+ * have to keep being true:
+ *
+ *   1. Every `await` that can reject is inside the try/catch below, whose handler settles the
+ *      record rather than rethrowing.
+ *   2. `store.update` swallows its own persistence failures (see `save`), so no settle can
+ *      reject on the way out.
+ *   3. The two settles that sit OUTSIDE the try — the pre-dial and request-phase aborts — unlink
+ *      the partial through `dropPartial`, which is best-effort. A bare `rm(..., {force:true})`
+ *      there suppressed ENOENT and nothing else, so an EPERM from an antivirus scanner rejected
+ *      straight out of this function.
+ *
+ * The `finally` calls `res.abort()`, which both requesters implement as a `destroy()` that does
+ * not throw. An implementation of `Requester` whose `abort` can throw would break the contract.
  */
 export async function transfer(
   id: string,
@@ -157,11 +197,64 @@ export async function transfer(
   let have = 0;
   try { have = (await stat(part)).size; } catch { /* no partial */ }
 
+  /**
+   * Best-effort, exactly as `store.remove` is and for exactly the same reason. `rm`'s `force`
+   * suppresses ENOENT and nothing else, so an EPERM or EBUSY from an antivirus scanner or a
+   * search indexer holding the file — which `store.ts` rightly calls ordinary on Windows —
+   * would reject out of a function that promises never to. Leaving the bytes for the retention
+   * sweep is a leak; wedging the record forever is worse, so log and carry on.
+   */
+  const dropPartial = async (): Promise<void> => {
+    try {
+      await rm(part, { force: true });
+    } catch (e: unknown) {
+      log.warn('could not delete a download partial; the bytes remain until the sweep', {
+        id, path: part, reason: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  /**
+   * The one place a failure is written.
+   *
+   * `completedAt` is stamped here rather than left null. The retention sweep ages a record from
+   * `completedAt ?? createdAt`, so without it a failure's TTL runs from when the download
+   * *started* — a transfer that ran for twenty hours before dropping would be reclaimable
+   * within minutes, taking the partial a retry wants with it. `load()`'s demotion already
+   * stamps it for the same reason.
+   */
+  const settleFailed = async (
+    error: { code: FailureCode; message: string },
+    received?: number,
+  ): Promise<void> => {
+    const patch: Partial<DownloadRecord> = { state: 'failed', error, completedAt: store.nowMs() };
+    if (received !== undefined) patch.received = received;
+    await store.update(id, patch);
+  };
+
   /** Cancel is the one outcome that drops the partial; every failure below keeps it. */
   const settleCancelled = async (received: number): Promise<void> => {
-    await rm(part, { force: true });
+    await dropPartial();
     log.info('download cancelled', { id, received });
-    await store.update(id, { state: 'cancelled', received, error: coded('cancelled', 'cancelled by the caller') });
+    await store.update(id, {
+      state: 'cancelled', received, completedAt: store.nowMs(),
+      error: coded('cancelled', 'cancelled by the caller'),
+    });
+  };
+
+  /**
+   * One signal carries two different events, and they owe the record different answers.
+   *
+   * A caller's DELETE means "throw it away": the partial goes and the record reads `cancelled`.
+   * The idle watchdog's abort means "the far end stopped sending" — a retryable host fault the
+   * caller never asked for — so the partial is KEPT for a later resume and the record reads
+   * `failed`/`network`, which is also what makes a re-POST reclaim it rather than restart from
+   * byte zero. `signal.reason` is the only thing that tells them apart; see `STALLED`.
+   */
+  const settleAborted = async (received: number): Promise<void> => {
+    if (signal.reason !== STALLED) { await settleCancelled(received); return; }
+    log.warn('download abandoned after a stall; the partial is kept for a resume', { id, received });
+    await settleFailed(coded('network', STALL_MESSAGE), received);
   };
 
   const headers: Record<string, string> = {};
@@ -170,7 +263,7 @@ export async function transfer(
 
   // Cancelled before we even dialled. Opening the socket only to tear it down would be
   // pointless work, and leaving the record `running` would leave it unreclaimable.
-  if (signal.aborted) { await settleCancelled(have); return; }
+  if (signal.aborted) { await settleAborted(have); return; }
 
   await store.update(id, { state: 'running' });
 
@@ -180,10 +273,10 @@ export async function transfer(
   } catch (e: unknown) {
     // A cancel during the request phase surfaces here as a rejection, and it is a cancel, not
     // a network fault: recording it as `failed` would put it in front of the retry logic.
-    if (signal.aborted) { await settleCancelled(have); return; }
+    if (signal.aborted) { await settleAborted(have); return; }
     const error = failureOf(e);
     log.warn('download request failed', { id, ...error });
-    await store.update(id, { state: 'failed', error });
+    await settleFailed(error);
     return;
   }
 
@@ -199,7 +292,7 @@ export async function transfer(
   try {
     if (res.status < 200 || res.status >= 300) {
       log.warn('download rejected by the server', { id, status: res.status });
-      await store.update(id, { state: 'failed', error: coded('http-error', `server answered ${res.status}`) });
+      await settleFailed(coded('http-error', `server answered ${res.status}`));
       return;
     }
 
@@ -208,19 +301,39 @@ export async function transfer(
     // elsewhere — is a body we cannot append to, so the partial goes.
     const claimedStart = res.status === 206 ? rangeStart(res.headers['content-range']) : null;
 
+    // A 206 answering a resume with NO readable `content-range` says nothing about where its
+    // body starts, and the two possibilities are indistinguishable from here. RFC 9110 requires
+    // the header, so a compliant server that honoured `bytes=N-` is sending only the TAIL —
+    // sloppy proxies omit it anyway. Falling through to "it ignored the range, restart from
+    // zero" would then write that tail as if it were the whole file: `total` becomes
+    // `0 + declared`, the length check passes, and the record settles `done` carrying a
+    // valid-looking sha256 of the wrong bytes. That is exactly the silent-corruption class the
+    // third-offset refusal below closed, reached from the other side, so it gets the same
+    // answer — refuse the body. `have === 0` is untouched: nothing was asked for, so a 206
+    // there is just a whole body.
+    if (have > 0 && res.status === 206 && claimedStart === null) {
+      log.warn('download refused: a 206 answered a resume with no readable content-range', {
+        id, have, contentRange: res.headers['content-range'] ?? null,
+      });
+      await settleFailed({
+        code: 'http-error',
+        message:
+          `server answered 206 to a request from byte ${have} but sent no readable ` +
+          `content-range; its body cannot be placed correctly`,
+      });
+      return;
+    }
+
     // A 206 claiming a THIRD offset — neither what we asked for nor zero — is unusable in both
     // directions: appending puts the wrong bytes at `have`, and restarting writes a body that
     // does not begin at byte zero. Either way the length check still passes and the file is
     // marked done with a wrong sha256 of a wrong file. Refuse the body instead of writing it.
     if (claimedStart !== null && claimedStart !== have && claimedStart !== 0) {
-      await store.update(id, {
-        state: 'failed',
-        error: {
-          code: 'http-error',
-          message:
-            `server answered 206 from byte ${claimedStart}, but we asked from ${have}; ` +
-            `its body cannot be placed correctly`,
-        },
+      await settleFailed({
+        code: 'http-error',
+        message:
+          `server answered 206 from byte ${claimedStart}, but we asked from ${have}; ` +
+          `its body cannot be placed correctly`,
       });
       return;
     }
@@ -230,7 +343,7 @@ export async function transfer(
       log.info('server ignored the range request, restarting the download', {
         id, discarded: have, status: res.status, contentRange: res.headers['content-range'] ?? null,
       });
-      await rm(part, { force: true });
+      await dropPartial();
       have = 0;
     }
 
@@ -275,26 +388,32 @@ export async function transfer(
       await release(out);
     }
 
-    if (signal.aborted) { await settleCancelled(received); return; }
+    if (signal.aborted) { await settleAborted(received); return; }
 
-    // The partial is deliberately KEPT on every failure below: a later attempt resumes from it.
+    // The partial is deliberately KEPT on every failure below, and two things now pick it up.
+    // A restart re-queues the record under its original id (`resume.ts`), and — for a failure
+    // the retry can plausibly get past, which is what `network` means — a re-POST for the same
+    // target reclaims THIS record rather than minting a new id (`store.findResumable`, used by
+    // `/gh/fetch`). A permanent failure keeps its partial too, but nothing resumes from it: it
+    // is left for the retention sweep, because retrying a 404 or a full disk only hits the same
+    // wall again.
     if (writeError !== null) {
       const error = failureOf(writeError);
       log.warn('download could not be written to disk', { id, ...error });
-      await store.update(id, { state: 'failed', received, error });
+      await settleFailed(error, received);
       return;
     }
 
     if (streamError !== null) {
       const error = failureOf(streamError);
       log.warn('download stream failed', { id, received, ...error });
-      await store.update(id, { state: 'failed', received, error });
+      await settleFailed(error, received);
       return;
     }
 
     if (total >= 0 && received !== total) {
       log.warn('download ended short', { id, received, expected: total });
-      await store.update(id, { state: 'failed', received, error: coded('network', `expected ${total} bytes, received ${received}`) });
+      await settleFailed(coded('network', `expected ${total} bytes, received ${received}`), received);
       return;
     }
 
@@ -310,7 +429,7 @@ export async function transfer(
     // could not be read. The partial, if any, stays put.
     const error = failureOf(e);
     log.warn('download failed', { id, ...error });
-    await store.update(id, { state: 'failed', error });
+    await settleFailed(error);
   } finally {
     signal.removeEventListener('abort', onAbort);
     // A body we stopped reading early still owns a socket. Reading one to its end does not,

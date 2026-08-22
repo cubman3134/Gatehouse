@@ -19,6 +19,13 @@ type GhCode = 'bad-request' | 'not-found' | 'not-ready' | 'internal';
 
 const MAX_BODY_BYTES = 64 * 1024;
 
+/**
+ * How much of an over-long body we will read and throw away after answering, purely so the
+ * close is an orderly one. A courtesy, not an obligation — nothing is buffered. Its own
+ * constant rather than an import from `server.ts`, which imports this module.
+ */
+const MAX_DRAIN_BYTES = 8_000_000;
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) });
@@ -30,7 +37,14 @@ function sendError(res: ServerResponse, status: number, code: GhCode, message: s
   sendJson(res, status, { error: { code, message } });
 }
 
-function readBody(req: IncomingMessage): Promise<string | null> {
+/**
+ * Resolves rather than rejects — this is awaited from a handler whose call site is `void`ed,
+ * and an unhandled rejection takes a daemon down. `tooLarge` is distinguished from `unreadable`
+ * because only the first has a client still pushing bytes at us that has to be dealt with.
+ */
+type Body = { ok: true; text: string } | { ok: false; tooLarge: boolean };
+
+function readBody(req: IncomingMessage): Promise<Body> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -38,13 +52,37 @@ function readBody(req: IncomingMessage): Promise<string | null> {
     req.on('data', (c: Buffer) => {
       if (settled) return;
       size += c.length;
-      if (size > MAX_BODY_BYTES) { settled = true; resolve(null); return; }
+      if (size > MAX_BODY_BYTES) { settled = true; resolve({ ok: false, tooLarge: true }); return; }
       chunks.push(c);
     });
-    req.on('end', () => { if (!settled) { settled = true; resolve(Buffer.concat(chunks).toString('utf8')); } });
-    // Resolves rather than rejects: this promise is awaited from a handler whose call site is
-    // `void`ed, and an unhandled rejection takes a daemon down. `null` is "unreadable".
-    req.on('error', () => { if (!settled) { settled = true; resolve(null); } });
+    req.on('end', () => { if (!settled) { settled = true; resolve({ ok: true, text: Buffer.concat(chunks).toString('utf8') }); } });
+    req.on('error', () => { if (!settled) { settled = true; resolve({ ok: false, tooLarge: false }); } });
+  });
+}
+
+/**
+ * Answer first, hang up second — the same shape `/v1` uses in `server.ts`, and for the same
+ * measured reason. Resolving the read stops us buffering, but it does not stop the client, and
+ * ending the response while unread inbound data is still arriving makes the OS send RST rather
+ * than FIN. An RST discards whatever of our reply is still in the client's receive buffer, so
+ * it observes ECONNRESET instead of the 400 we just wrote.
+ *
+ * So: pause, write the reply, then drain a bounded remainder so the close is a FIN. Only a
+ * client that keeps pushing past that gets cut off, and by then it has long since had its 400.
+ * `setImmediate` rather than a same-tick destroy because `finish` means "handed to the socket",
+ * not "transmitted", and an RST discards the sender's unflushed buffer too.
+ *
+ * Call this BEFORE sending, so the pause and the `finish` listener are both in place.
+ */
+function drainAfterAnswering(req: IncomingMessage, res: ServerResponse): void {
+  req.pause();
+  res.on('finish', () => {
+    let drained = 0;
+    req.on('data', (c: Buffer) => {
+      drained += c.length;
+      if (drained > MAX_DRAIN_BYTES) setImmediate(() => req.destroy());
+    });
+    req.resume();
   });
 }
 
@@ -91,12 +129,16 @@ function safeDecode(s: string): string {
 }
 
 async function postFetch(req: IncomingMessage, res: ServerResponse, deps: GhDeps): Promise<void> {
-  const raw = await readBody(req);
-  if (raw === null) { sendError(res, 400, 'bad-request', 'request body was unreadable or too large'); return; }
+  const read = await readBody(req);
+  if (!read.ok) {
+    if (read.tooLarge) drainAfterAnswering(req, res);
+    sendError(res, 400, 'bad-request', 'request body was unreadable or too large');
+    return;
+  }
 
   let body: Record<string, unknown>;
   try {
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(read.text);
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not an object');
     body = parsed as Record<string, unknown>;
   } catch {
@@ -126,6 +168,30 @@ async function postFetch(req: IncomingMessage, res: ServerResponse, deps: GhDeps
     }
     referer = parsedReferer.href;
   }
+
+  // Nothing is open for this target, but something may be RESUMABLE: a record that settled
+  // `failed` with a transient code and whose `.part` is still on disk. Take it over — same id,
+  // back to `queued`, straight onto the queue — so the caller's retry after a mid-body drop
+  // continues from the bytes we already have instead of pulling a 40GB file again from zero.
+  // Without this the partial `transfer` deliberately keeps has no reader outside a restart.
+  //
+  // AFTER the referer check, so a malformed referer is still a 400 rather than being silently
+  // ignored; the reclaimed record keeps the referer it was created with, since it is resuming
+  // that same fetch. `store.findResumable` is what decides what may be reclaimed and why —
+  // notably not a cancel and not a permanent failure. `findOpen` above still runs first, so a
+  // target already being worked on is never reclaimed out from under its own transfer.
+  const resumable = await deps.store.findResumable(target.session, target.url);
+  if (resumable) {
+    // Unsettled BEFORE the submit, exactly as `requeueInterrupted` does it: that is what makes
+    // `findOpen` fold the next request onto this job. The stale `error` and `completedAt` go
+    // with it, or `/gh/jobs/<id>` would report a queued job that also carries a failure.
+    await deps.store.update(resumable.id, { state: 'queued', error: undefined, completedAt: null });
+    log.info('resuming a failed download in place of a new one', { id: resumable.id, received: resumable.received });
+    deps.submit(resumable.id);
+    sendJson(res, 202, { jobId: resumable.id, state: 'queued' });
+    return;
+  }
+
   const rec = await deps.store.create({ url: target.url, session: target.session, referer });
   deps.submit(rec.id);
   sendJson(res, 202, { jobId: rec.id, state: rec.state });

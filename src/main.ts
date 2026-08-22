@@ -9,7 +9,7 @@ import type { GhDeps } from './api/gh.js';
 import { DownloadStore } from './downloads/store.js';
 import { requeueInterrupted } from './downloads/resume.js';
 import { isSettled } from './downloads/record.js';
-import { transfer, type Requester, type TransferResponse } from './downloads/transfer.js';
+import { transfer, STALLED, type Requester, type TransferResponse } from './downloads/transfer.js';
 import { log } from './log.js';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -23,6 +23,13 @@ app.on('window-all-closed', () => { /* keep running */ });
 
 /** What to print for a bind that names no reachable address of its own. */
 const WILDCARD_LOOPBACK: Record<string, string> = { '0.0.0.0': '127.0.0.1', '::': '[::1]' };
+
+/**
+ * How often retention is enforced on a daemon with nothing to do. Deliberately coarse: the
+ * event-driven sweeps below do the real work, and this only exists so that "expired" means
+ * something on a box where nobody downloads anything for a week.
+ */
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * A `Requester` over Electron's `net`, issued on a named partition.
@@ -179,13 +186,16 @@ async function start(): Promise<void> {
    * move 4MB on a slow link -- 120s is; see the note on the range in `config.ts` before anyone
    * tightens it.
    *
-   * Aborting is ALL this does. The transfer's own cancel path notices the signal, closes its
-   * stream, drops the partial and only then settles the record, so the single terminal-state
-   * writer stays where it is, per the invariant in `downloads/record.ts`. One consequence
-   * worth naming: the record's message reads `cancelled by the caller`, because `transfer` is
-   * handed a signal and cannot see who pulled it. Distinguishing a stall would mean writing a
-   * terminal state from here -- a second settle site, which is precisely what that invariant
-   * forbids. The log line below is where an operator finds out which it was.
+   * Aborting is ALL this does. `transfer` notices the signal, closes its stream and only then
+   * settles the record, so the single terminal-state writer stays where it is, per the
+   * invariant in `downloads/record.ts`.
+   *
+   * The abort carries a REASON, though, and that is what stops it lying to the caller. Aborting
+   * bare would land on the transfer's cancel path: the partial deleted and the record settled
+   * `cancelled` — a 40GB download binned at 95% because the host went quiet, reported with a
+   * code that reads as the caller's own doing. Passing `STALLED` lets `transfer` tell the two
+   * apart on `signal.reason` and settle a stall as `failed`/`network` with its partial kept, so
+   * a re-POST resumes it. Still one settle site; only the reason crosses.
    */
   function watchForStall(id: string, ac: AbortController): () => void {
     let lastReceived = store.get(id)?.received ?? 0;
@@ -207,7 +217,7 @@ async function start(): Promise<void> {
       log.warn('aborting a download that made no progress within the stall window', {
         id, received: rec.received, stallMs: cfg.downloadStallMs,
       });
-      ac.abort();
+      ac.abort(STALLED);
     }, tick);
     // The transfer holds the process up on its own; an interval that outlived it would be a
     // leak on a daemon that runs for weeks, and would abort a later job sharing the id.
@@ -242,6 +252,20 @@ async function start(): Promise<void> {
   await requeueInterrupted(store, submitDownload);
   await store.sweep();
 
+  // Startup and after-every-transfer are both event-driven, and between them they miss the one
+  // case the TTL is actually a promise about: a daemon that goes quiet. Nothing finishes, so
+  // nothing sweeps, and expired bytes sit on disk until the next download — which on an idle
+  // box may be never. `unref` so this can never be the reason the process stays alive, and it
+  // is cleared on the way out below.
+  const sweepTimer = setInterval(() => {
+    // `void`ed, so the `catch` is not optional: `sweep` reaches the filesystem, and an
+    // unhandled rejection in a daemon is `exit 1`.
+    void store.sweep().catch((e: unknown) => {
+      log.warn('the periodic retention sweep failed', { message: e instanceof Error ? e.message : String(e) });
+    });
+  }, SWEEP_INTERVAL_MS);
+  sweepTimer.unref?.();
+
   const ghDeps: GhDeps = {
     store,
     // `submit` returns a job record; nothing here awaits it, and the queue captures a failing
@@ -266,7 +290,7 @@ async function start(): Promise<void> {
   // `http://0.0.0.0:8191` connects nowhere useful. Advertise the loopback the wildcard covers.
   const host = WILDCARD_LOOPBACK[cfg.bind] ?? cfg.bind;
   process.stdout.write(`GATEHOUSE_READY http://${host}:${server.port}\n`);
-  app.on('before-quit', () => { pool.destroy(); void server.close(); });
+  app.on('before-quit', () => { clearInterval(sweepTimer); pool.destroy(); void server.close(); });
 }
 
 // Startup runs entirely inside the guard. loadConfig, the pool and the solver used to sit

@@ -108,8 +108,9 @@ no response and no error, so nothing in the transfer ever fires — it would hol
 wedge the whole download surface while `/gh/fetch` kept answering 202 to work that never ran.
 Progress is persisted every 4 MB, so the window has to stay comfortably above the time to move
 4 MB on the slowest link you care about; the floor of 5000 is there to stop it being tightened
-into killing healthy-but-slow transfers. An aborted transfer settles `cancelled` — see
-`DELETE /gh/jobs/:id` below for why it reads as a caller cancel.
+into killing healthy-but-slow transfers. An abandoned transfer settles `failed` with code
+`network`, **keeps its partial**, and can be resumed by re-`POST`ing the same target — it is a
+host fault, not a cancel. See `DELETE /gh/jobs/:id` below.
 
 **Auth.** A loopback bind takes no auth, because FlareSolverr clients send no
 `Authorization` header and requiring one would break drop-in compatibility on day one.
@@ -192,9 +193,21 @@ into a manifest that is rewritten on every progress tick.
 
 Answers `202` with `{"jobId":"…","state":"queued"}`. A second `POST` for the same
 `site` + `url` while the first is still unsettled returns **that** job rather than starting a
-second transfer. Once a job has settled it is no longer open, so a repeat request starts a
-fresh download — a completed one must not pin a caller to bytes that may already have been
-released.
+second transfer. Once a job has settled it is no longer open, so a repeat request generally
+starts a fresh download — a completed one must not pin a caller to bytes that may already have
+been released.
+
+**One settled job is reclaimed rather than replaced.** If the previous attempt at this exact
+`site` + `url` ended `failed` with a *transient* code (`network` — a mid-body drop, a stall)
+and its partial file is still on disk, the `POST` puts **that** record back to `queued` and
+answers with **its existing `jobId`**. The transfer then resumes with a `Range` request from
+the bytes already downloaded. Retrying a 40GB download after a blip does not start over.
+
+Only a transient failure is reclaimed. A `http-error` (a 404, a refused `206`) or a
+`disk-full` stays settled and the retry gets a new id, because resuming it would hit the same
+wall. A `cancelled` job is never reclaimed either: you asked for it to stop, and its partial
+is already gone. Neither is a record whose partial has since been swept — there would be
+nothing to resume from.
 
 ### `GET /gh/jobs/:id`
 
@@ -234,12 +247,16 @@ still reports `queued` or `running`, and the record is still open, so a `POST /g
 the same target dedupes onto the job you just cancelled. If you mean to start over, wait for
 the state to settle first.
 
-A `cancelled` record does not tell you *who* cancelled it: an idle transfer aborted by
-`GATEHOUSE_DOWNLOAD_STALL_MS` settles with exactly the same state and the same
-`cancelled by the caller` message as one you cancelled yourself. The transfer is handed an
-abort signal and cannot see where it came from, and inventing a second terminal state written
-from somewhere else would break the rule that exactly one place settles a record. The
-distinction is in the log, not on the wire.
+`cancelled` means **you** cancelled it. An idle transfer abandoned by
+`GATEHOUSE_DOWNLOAD_STALL_MS` does not settle that way: a host that stops sending is a
+retryable fault you did not ask for, so it settles `failed` with code `network` and a message
+naming the stall — **and it keeps its partial**, so a re-`POST` resumes it (see
+`POST /gh/fetch` above) rather than pulling the whole file again. Binning 95% of a large
+download because the far end went quiet, and reporting it as your own doing, was the wrong
+answer to both questions.
+
+The watchdog still only *aborts*; it passes a reason with the abort and the transfer settles
+the record itself, so exactly one place writes a terminal state.
 
 ### `GET /gh/files/:id`
 
@@ -293,17 +310,29 @@ not ours. Re-queued records are unsettled again *before* the retention sweep run
 that outlived `GATEHOUSE_DOWNLOAD_TTL_MS` while the daemon was down is resumed rather than
 reclaimed out from under the transfer.
 
-If the server ignores the `Range` — a `200`, or a `206` starting somewhere other than where we
-asked — the partial is discarded and the download restarts from zero rather than being silently
-corrupted. Resuming is an optimisation; correctness is not negotiated for it.
+A restart is not the only thing that resumes, though it is the only *automatic* one. A caller's
+re-`POST` after a transient failure reclaims the record and resumes it too — that is the case
+described under `POST /gh/fetch`, and between them they are what make "the partial is kept on
+every failure" a promise worth anything.
+
+If the server ignores the `Range` and answers `200`, the partial is discarded and the download
+restarts from zero rather than being silently corrupted. If it answers `206` but starts
+somewhere other than where we asked — or answers `206` with **no readable `Content-Range` at
+all**, which some proxies do — the response is refused outright and the job fails
+`http-error`. That second one looks harmless and is not: a server that honoured `bytes=N-`
+while dropping the header is sending only the tail, so treating it as "the range was ignored"
+and restarting would write the tail as if it were the whole file, `Content-Length` would agree,
+and the job would settle `done` carrying a perfectly valid `sha256` of the wrong bytes.
+Resuming is an optimisation; correctness is not negotiated for it.
 
 ### Retention will delete your file
 
 There is a safety net for a consumer that never calls `DELETE`, and it is a real one, not a
 formality. A **completed** download is removed once it is older than `GATEHOUSE_DOWNLOAD_TTL_MS`
 (24h by default), and completed downloads are evicted least-recently-served-first whenever the
-directory exceeds `GATEHOUSE_DOWNLOAD_MAX_BYTES`. The sweep runs on startup and after every
-transfer.
+directory exceeds `GATEHOUSE_DOWNLOAD_MAX_BYTES`. The sweep runs on startup, after every
+transfer, and hourly — the last one so that a daemon nobody downloads anything through still
+honours the TTL rather than holding expired bytes until the next request.
 
 So: **a completed download that was never released can be deleted out from under you.** If
 you took the local `path` and have not copied or moved the file yet, it can vanish. Copy it,
@@ -314,18 +343,23 @@ any age or size.
 
 The download path has **never been run against a real content source, and never against a
 multi-GB file.** Every test here runs against a local fixture HTTP server in `test/fixture/`
-that serves a few megabytes and can be told to truncate, stall, lie about `Content-Range` or
-answer chunked. That fixture proves the *mechanism* — resume, cancel, dedupe, hashing, Range
-serving, and the refusal to append a body the server did not actually send from the offset we
-asked for. It cannot prove behaviour at 4GB, on a slow or flaky link, or against a host that
-is actually trying to tell a browser from a script.
+that serves a few megabytes and can be told to truncate, stall, lie about `Content-Range`, omit
+it entirely, or answer chunked. That fixture proves the *mechanism* — resume, cancel, dedupe,
+hashing, Range serving, and the refusal to write a body the server did not actually send from
+the offset we asked for. It cannot prove behaviour at 4GB, on a slow or flaky link, or against
+a host that is actually trying to tell a browser from a script.
 
 The restart-resume path above is covered in two pieces rather than one: the *decision* about
 what to re-queue is unit-tested against a hand-built manifest, and the `Range` request and the
-refusal to append a body the server did not send from our offset are unit-tested against the
+refusal to write a body the server did not send from our offset are unit-tested against the
 fixture. A real kill-the-app-mid-body-and-restart run was done by hand and did resume under the
 same job id from the surviving partial — but by hand, against the local fixture, so it says
 nothing about a host's willingness to honour a `Range` hours later.
+
+The re-`POST` resume is in better shape: it was run end to end against the fixture — a drop at
+the halfway mark, a retry that came back with the same `jobId`, a `bytes=100000-` on the wire
+and a `sha256` matching the whole file. Against the fixture, though, and at 200KB rather than
+40GB, so it proves the decision and the plumbing, not the endurance.
 
 Two specifics worth knowing before you rely on it. Hashing is a **second pass** over the
 finished file rather than a streaming digest, so a large download is read from disk twice

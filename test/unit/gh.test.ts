@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createServer, type Server } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -51,6 +51,51 @@ describe('POST /gh/fetch', () => {
     expect(submitted).toEqual(['d1']); // scheduled once, not twice
   });
 
+  // `transfer` keeps a partial on every failure so a later attempt can resume from it. Outside
+  // a restart, THIS is the attempt: a re-POST takes the failed record over under its own id
+  // rather than minting a new one, or a 40GB download restarts from zero after a blip and the
+  // kept bytes are orphaned until the sweep.
+  it('resumes a transiently-failed download under its existing job id', async () => {
+    await post({ url: 'http://example.test/f.bin' });
+    await writeFile(store.partPath('d1'), 'the bytes we already have');
+    await store.update('d1', { state: 'failed', received: 25, error: { code: 'network', message: 'connection reset' }, completedAt: clock });
+    submitted.length = 0;
+
+    const res = await post({ url: 'http://example.test/f.bin' });
+    expect(res.status).toBe(202);
+    const body = await res.json() as any;
+    expect(body.jobId).toBe('d1'); // the same id, not a fresh d2
+    expect(body.state).toBe('queued');
+    expect(submitted).toEqual(['d1']);
+    // Unsettled again, and the stale failure cleared — or `/gh/jobs/d1` would report a queued
+    // job that also carries an error, and `findOpen` would not fold the next request onto it.
+    const rec = store.get('d1')!;
+    expect(rec.state).toBe('queued');
+    expect(rec.error).toBeUndefined();
+    expect(rec.completedAt).toBeNull();
+    expect(rec.received).toBe(25); // the progress it resumes from
+  });
+
+  it('does not resume a permanent failure or a cancel', async () => {
+    for (const [url, patch] of [
+      ['http://example.test/a.bin', { state: 'failed' as const, error: { code: 'http-error' as const, message: '404' } }],
+      ['http://example.test/b.bin', { state: 'failed' as const, error: { code: 'disk-full' as const, message: 'ENOSPC' } }],
+      ['http://example.test/c.bin', { state: 'cancelled' as const, error: { code: 'cancelled' as const, message: 'cancelled by the caller' } }],
+    ] as const) {
+      const first = ((await (await post({ url })).json()) as any).jobId as string;
+      await writeFile(store.partPath(first), 'leftovers');
+      await store.update(first, { ...patch, completedAt: clock });
+      const again = ((await (await post({ url })).json()) as any).jobId as string;
+      expect(again, url).not.toBe(first); // a fresh id, a fresh download
+    }
+  });
+
+  it('does not resume a failure whose partial is gone', async () => {
+    await post({ url: 'http://example.test/f.bin' });
+    await store.update('d1', { state: 'failed', error: { code: 'network', message: 'reset' }, completedAt: clock });
+    expect(((await (await post({ url: 'http://example.test/f.bin' })).json()) as any).jobId).toBe('d2');
+  });
+
   it('rejects a file: url with our error shape', async () => {
     const res = await post({ url: 'file:///C:/secrets.txt' });
     expect(res.status).toBe(400);
@@ -97,6 +142,34 @@ describe('POST /gh/fetch', () => {
 
   it('405s a GET', async () => {
     expect((await fetch(`${base}/gh/fetch`)).status).toBe(405);
+  });
+
+  // Answer-then-drain, the shape `/v1` already uses. Resolving the read stops US buffering, but
+  // it does not stop the client: ending the response while unread inbound data is still
+  // arriving makes the OS send RST rather than FIN, and an RST discards the 400 sitting in the
+  // client's receive buffer. The client would see ECONNRESET instead of the refusal.
+  it('answers an oversized body with a 400 the client actually receives', async () => {
+    const u = new URL(`${base}/gh/fetch`);
+    const answer = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const req = httpRequest(
+        { hostname: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json' } },
+        (res) => {
+          let text = '';
+          res.setEncoding('utf8');
+          res.on('data', (c: string) => { text += c; });
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, text }));
+        },
+      );
+      req.on('error', reject);
+      // Well past the 64KB cap and written in pieces, so the crossing lands mid-upload with
+      // plenty still to come — which is the only arrangement that can produce the reset.
+      const chunk = Buffer.alloc(64 * 1024, 0x61);
+      for (let i = 0; i < 8; i++) req.write(chunk);
+      req.end();
+    });
+    expect(answer.status).toBe(400);
+    expect((JSON.parse(answer.text) as any).error.code).toBe('bad-request');
+    expect(submitted).toEqual([]);
   });
 });
 
