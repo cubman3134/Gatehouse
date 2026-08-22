@@ -69,10 +69,15 @@ function tokenMatches(supplied: string, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-function authorized(req: IncomingMessage, cfg: GatehouseConfig): boolean {
+function authorized(req: IncomingMessage, cfg: GatehouseConfig, loopback: boolean): boolean {
   // A loopback bind takes no auth: Allarr's FlareSolverr client sends no Authorization
   // header, and requiring one would break drop-in compatibility on day one.
-  if (isLoopback(cfg.bind)) return true;
+  //
+  // `loopback` is the verdict on the address `listen` ACTUALLY bound, not on `cfg.bind`. A
+  // name like `localhost` goes through DNS/hosts and need not land on 127.0.0.1; exempting on
+  // the string would then hand an unauthenticated driver to whatever it did resolve to — and
+  // a configured token would never be consulted, so it would not save us.
+  if (loopback) return true;
   // Falsy, not `=== null`: an empty token would sail through and `timingSafeEqual` returns
   // true for two empty buffers, so `Authorization: Bearer ` would authenticate. This branch
   // exists so the gate does not depend on `loadConfig` having rejected that first.
@@ -95,10 +100,15 @@ function boundToLoopback(address: string): boolean {
 }
 
 export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: () => object): Promise<ServerHandle> {
+  // Seeded from the configured name, then replaced below with the verdict on the address that
+  // was actually bound. Nothing can be served before `listen` resolves, so the seed value is
+  // never the one a request is judged against.
+  let loopback = isLoopback(cfg.bind);
+
   const server = createServer((req, res) => {
     void (async () => {
       try {
-        if (!authorized(req, cfg)) { send(res, 401, { status: 'error', message: 'unauthorized' }); return; }
+        if (!authorized(req, cfg, loopback)) { send(res, 401, { status: 'error', message: 'unauthorized' }); return; }
 
         const path = (req.url ?? '/').split('?')[0] ?? '/';
 
@@ -129,7 +139,11 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
               let drained = 0;
               req.on('data', (c: Buffer) => {
                 drained += c.length;
-                if (drained > MAX_DRAIN_BYTES) req.destroy();
+                // setImmediate, NOT a same-tick destroy: `finish` means "handed to the
+                // socket", not "transmitted", and an RST discards the sender's unflushed
+                // buffer too. Destroying in the same turn as the crossing chunk loses the
+                // 500 we just wrote (measured: same-tick 3/3 reset, next-turn 3/3 delivered).
+                if (drained > MAX_DRAIN_BYTES) setImmediate(() => req.destroy());
               });
               req.resume();
             });
@@ -196,7 +210,9 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
   // The auth gate exempts loopback on the strength of `cfg.bind`, a string. What is actually
   // reachable is what `listen` bound — `localhost` goes through DNS/hosts and need not land
   // on 127.0.0.1. If they disagree and there is no token, nothing is guarding the door.
-  if (!boundToLoopback(address.address) && !cfg.token) {
+  loopback = boundToLoopback(address.address);
+
+  if (!loopback && !cfg.token) {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     throw new ConfigError(
       `GATEHOUSE_BIND=${cfg.bind} resolved to ${address.address}, which is reachable off-box, ` +

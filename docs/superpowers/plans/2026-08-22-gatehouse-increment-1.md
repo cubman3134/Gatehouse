@@ -1525,7 +1525,7 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
 - [ ] **Step 5: Run the tests and confirm they pass**
 
 Run: `npx vitest run test/unit/server.test.ts`
-Expected: PASS, 8 tests
+Expected: PASS (the amendment above adds tests; the file lands at 14)
 
 - [ ] **Step 6: Commit**
 

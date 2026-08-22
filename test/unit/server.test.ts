@@ -4,6 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { startServer, PortInUseError, type ServerHandle } from '../../src/api/server.js';
 import type { V1Deps, Solution } from '../../src/api/v1.js';
 import { ConfigError, loadConfig } from '../../src/config.js';
+import { log } from '../../src/log.js';
 
 const solution: Solution = {
   url: 'http://example.test/', status: 200, headers: {},
@@ -87,7 +88,16 @@ describe('startServer', () => {
   // failure (EMFILE) is an unhandled 'error' event, which throws and kills the daemon.
   it('survives a server-level error after startup', async () => {
     h = await startServer(loadConfig({ GATEHOUSE_PORT: '0' }), deps(), health);
-    expect(() => h!.server.emit('error', new Error('boom'))).not.toThrow();
+
+    // Spy as well as not-throwing: an `emit` on an emitter with zero listeners throws, so
+    // not-throwing alone is also satisfied by a listener that silently swallows the error.
+    const spy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    try {
+      expect(() => h!.server.emit('error', new Error('boom'))).not.toThrow();
+      expect(spy).toHaveBeenCalledWith('server error', { message: 'boom' });
+    } finally {
+      spy.mockRestore();
+    }
 
     const res = await fetch(`http://127.0.0.1:${h.port}/gh/health`);
     expect(res.status).toBe(200);
