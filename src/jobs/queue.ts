@@ -102,6 +102,13 @@ export class JobQueue<P, R> {
       const payload = this.payloads.get(id);
       if (!job || payload === undefined) continue;
 
+      // Order matters. Mark running and claim the slot SYNCHRONOUSLY — the slot must be
+      // claimed in the same run-to-completion block as the guard above, or the bound does not
+      // hold. Then start the work on a microtask, for two reasons: a run() that throws
+      // SYNCHRONOUSLY lands in .catch instead of escaping pump() and leaking the slot forever;
+      // and setting job.state before the worker runs means a worker that writes job.state in
+      // its own prologue (a later increment sets 'pending-human') cannot be clobbered by us.
+      // Do NOT "simplify" this to a direct call — test/unit/queue.test.ts covers both.
       job.state = 'running';
       this.running++;
       void Promise.resolve()

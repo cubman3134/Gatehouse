@@ -13,6 +13,17 @@ function gate() {
   return { run, opened, failed };
 }
 
+/**
+ * Yield until `cond` holds. The queue starts work one microtask after submit(), and these
+ * tests need the worker's resolver before poking it. Looping rather than awaiting a fixed
+ * number of ticks means an extra hop inside pump() degrades to a timeout with a readable
+ * message instead of a TypeError on an undefined resolver.
+ */
+async function until(cond: () => boolean, ticks = 100): Promise<void> {
+  for (let i = 0; i < ticks && !cond(); i++) await Promise.resolve();
+  if (!cond()) throw new Error('condition never became true within ' + ticks + ' microtasks');
+}
+
 const ids = () => {
   let n = 0;
   return () => `job-${++n}`;
@@ -29,7 +40,8 @@ describe('JobQueue', () => {
 
     const job = q.submit('k1', 'alpha');
     expect(job.id).toBe('job-1');
-    // submit() starts the work synchronously when a slot is free, so 'running' is the honest reading.
+    // submit() claims the slot synchronously when one is free, so 'running' is the honest
+    // reading. (The work itself starts one microtask later — see pump().)
     expect(job.state).toBe('running');
 
     const done = await q.wait(job.id);
@@ -48,7 +60,7 @@ describe('JobQueue', () => {
     const job2 = q.submit('b', 'b');
     expect(job2.state).toBe('queued');
 
-    await Promise.resolve(); // Wait for run() to be called
+    await until(() => g.opened.length > 0); // let run() be invoked (it starts a microtask after submit)
 
     g.opened[0]!('done');
     await new Promise((r) => setTimeout(r, 0)); // Wait for pump() to start job2
@@ -103,6 +115,7 @@ describe('JobQueue', () => {
     const done1 = await q.wait(job1.id);
     expect(done1.state).toBe('failed');
     expect(done1.error?.message).toBe('sync boom');
+    expect(done1.error?.code).toBe('blocked');
     expect(q.busy).toBe(0);
 
     // Verify subsequent jobs still run
@@ -122,7 +135,7 @@ describe('JobQueue', () => {
     expect(b.id).toBe(a.id);
     expect(q.depth).toBe(1);
 
-    await Promise.resolve(); // Wait for run() to be called
+    await until(() => g.opened.length > 0); // let run() be invoked (it starts a microtask after submit)
 
     g.opened[0]!('done');
     await q.wait(a.id);
