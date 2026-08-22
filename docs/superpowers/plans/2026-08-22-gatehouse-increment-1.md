@@ -1489,6 +1489,39 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
 }
 ```
 
+> **Amended during Task 6 review.** The server code above is the starting shape and is missing
+> several things a long-running listener owes its caller:
+>
+> - **An oversized body must answer 500, not reset the connection.** `readBody`'s
+>   `req.destroy()` fires on the same tick as its reject, so the socket is gone before the
+>   catch can write — the client sees `ECONNRESET`. A transport error is a *worse* deviation
+>   than the 400 this design already forbids, because a FlareSolverr client degrades on a
+>   non-2xx but reads a reset as an availability failure. **Note:** deferring the destroy to
+>   `res.on('finish')` does NOT fix it — closing a socket that still has unread inbound data
+>   sends RST rather than FIN, and the RST discards the response. Answer, then *drain* a
+>   bounded remainder so the close is a FIN. This was measured, not reasoned.
+> - **Attach a permanent `error` listener after listen resolves.** `onListening` removes the
+>   startup handler, leaving the `net.Server` with zero `error` listeners; `net.Server` emits
+>   `error` on accept failure (`EMFILE`/`ENFILE` — realistic for a process that also spawns
+>   browsers) and an unhandled `error` event throws. The daemon dies instead of logging.
+> - **Guard the token check with `!cfg.token`, not `cfg.token === null`.** `timingSafeEqual`
+>   on two empty buffers returns `true`, so a config with `token: ''` would authenticate
+>   `Authorization: Bearer `. Unreachable via `loadConfig`, but this branch exists precisely
+>   so it does not depend on `loadConfig`.
+> - **Match the `Bearer` scheme case-insensitively** (RFC 7235), token case-sensitively.
+> - **Verify the resolved address after listen.** `GATEHOUSE_BIND=localhost` is treated as
+>   loopback while Node resolves it through DNS/hosts. Read `server.address()`; if it is not
+>   loopback and no token is set, close and refuse.
+> - **Emit the "8191 is FlareSolverr's own" sentence only when the port IS 8191**, or it
+>   misdirects an operator who set `GATEHOUSE_PORT=9000`.
+> - **Accept `HEAD` as well as `GET` on `/gh/health`** — monitoring probes use it.
+> - **Share the error-shape builder with `/v1`.** Export `fail` from `src/api/v1.ts` rather
+>   than hand-rolling the same object in `server.ts`, or the two drift silently.
+>
+> Test note: the two token tests must include a wrong token that is a strict **extension** of
+> the real one. With only different-length wrong tokens, the comparison can be weakened to
+> `startsWith` and the suite stays green.
+
 - [ ] **Step 5: Run the tests and confirm they pass**
 
 Run: `npx vitest run test/unit/server.test.ts`
