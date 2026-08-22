@@ -905,6 +905,37 @@ export async function serveFile(
 }
 ```
 
+> **Amended during Task 3 review — the `serveFile` above kills the daemon.**
+>
+> `await pipeline(createReadStream(...), res)` rejects with `ERR_STREAM_PREMATURE_CLOSE`
+> whenever a client goes away mid-download — user cancels, closes the tab, a media player
+> seeks and abandons, a proxy times out. For a download gateway that is the most ordinary
+> event there is, and unhandled it is `exit=1` every time. Reproduced on Node v24.14.0.
+>
+> A second reproduction: when the file is missing, `createReadStream` fails **after**
+> `writeHead` already sent `200, content-length: N` — the client gets a truncated 200 AND the
+> process dies.
+>
+> Required, all inside `serveFile` (it lives in this task's own file, so there is no reason to
+> defer it to a call site):
+>
+> - **Open the stream BEFORE writing headers.** Wait for its `open` event or its first error.
+>   An error at that point means nothing has been sent, so answer 500 honestly instead of a
+>   truncated 200.
+> - **Contain the streaming rejection.** Headers are already out by then, so there is no in-band
+>   way to signal failure: destroy the response socket and return normally. Log at **warn** —
+>   a client hang-up is routine and must not read as an error.
+> - **Validate `contentType`** before it reaches a header. It comes from the same untrusted
+>   upstream response as the filename this module already encodes; a CRLF in it makes
+>   `writeHead` throw. Anything not matching a conservative media-type pattern falls back to
+>   `application/octet-stream`.
+> - **Set `content-length: 0` on the 416**, or it goes out chunked.
+>
+> Test note: the injection test must assert the **encoded form** (`toContain('%0D%0A')`), not
+> read headers back through an HTTP parser that could never surface a smuggled header anyway.
+> The original assertions passed against a mutant that stripped CR/LF instead of encoding it,
+> and went red only via Node's internal validator plus a 60-second timeout.
+
 - [ ] **Step 4: Run it and confirm it passes**
 
 Run: `npx vitest run test/unit/range.test.ts`
