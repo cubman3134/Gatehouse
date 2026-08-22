@@ -94,7 +94,8 @@ function ok(deps: V1Deps, startTimestamp: number, extra: Record<string, unknown>
   };
 }
 
-function fail(deps: V1Deps, startTimestamp: number, message: string) {
+/** Exported so the HTTP layer's own error replies are built here rather than hand-rolled. */
+export function fail(deps: V1Deps, startTimestamp: number, message: string) {
   return {
     httpStatus: 500,
     body: {

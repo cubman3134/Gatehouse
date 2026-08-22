@@ -1,30 +1,52 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { timingSafeEqual } from 'node:crypto';
-import { isLoopback, type GatehouseConfig } from '../config.js';
-import { handleV1, type V1Deps } from './v1.js';
+import { ConfigError, isLoopback, type GatehouseConfig } from '../config.js';
+import { fail, handleV1, type V1Deps } from './v1.js';
 import { log } from '../log.js';
 
 export class PortInUseError extends Error {}
 
 export interface ServerHandle {
   port: number;
+  /**
+   * Exposed so a test can drive server-level events (an accept-time `error`, say) that no
+   * HTTP request can produce. Nothing in production reaches for it.
+   */
+  server: Server;
   close(): Promise<void>;
 }
 
 const MAX_BODY_BYTES = 1_000_000;
 
-function readBody(req: IncomingMessage): Promise<string> {
+/**
+ * How much of an over-long body we are willing to read and throw away after answering, purely
+ * so the connection can close cleanly. A courtesy, not an obligation — nothing is buffered.
+ */
+const MAX_DRAIN_BYTES = 8_000_000;
+
+/**
+ * Resolves rather than rejects on overflow: the caller has to answer with a real 500 before
+ * the socket goes away, and rejecting invited the old shape where `req.destroy()` ran on the
+ * same tick and the client saw `ECONNRESET` instead of the error body.
+ */
+type Body = { tooLarge: true } | { tooLarge: false; text: string };
+
+function readBody(req: IncomingMessage): Promise<Body> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let settled = false;
+    const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+
     req.on('data', (c: Buffer) => {
+      if (settled) return;
       size += c.length;
-      if (size > MAX_BODY_BYTES) { reject(new Error('request body too large')); req.destroy(); return; }
+      if (size > MAX_BODY_BYTES) { settle(() => resolve({ tooLarge: true })); return; }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
+    req.on('end', () => settle(() => resolve({ tooLarge: false, text: Buffer.concat(chunks).toString('utf8') })));
+    req.on('error', (e) => settle(() => reject(e)));
   });
 }
 
@@ -51,12 +73,25 @@ function authorized(req: IncomingMessage, cfg: GatehouseConfig): boolean {
   // A loopback bind takes no auth: Allarr's FlareSolverr client sends no Authorization
   // header, and requiring one would break drop-in compatibility on day one.
   if (isLoopback(cfg.bind)) return true;
-  if (cfg.token === null) return false;
+  // Falsy, not `=== null`: an empty token would sail through and `timingSafeEqual` returns
+  // true for two empty buffers, so `Authorization: Bearer ` would authenticate. This branch
+  // exists so the gate does not depend on `loadConfig` having rejected that first.
+  if (!cfg.token) return false;
 
   const header = req.headers.authorization ?? '';
   const prefix = 'Bearer ';
-  if (!header.startsWith(prefix)) return false;
+  // RFC 7235 makes the auth-scheme token case-insensitive; the credential after it is not.
+  if (header.slice(0, prefix.length).toLowerCase() !== prefix.toLowerCase()) return false;
   return tokenMatches(header.slice(prefix.length), cfg.token);
+}
+
+/**
+ * Loopback for a *resolved* address, which is a narrower question than `isLoopback(bind)`:
+ * no names, and the whole of 127/8 rather than one literal.
+ */
+function boundToLoopback(address: string): boolean {
+  const addr = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
+  return addr === '::1' || /^127\./.test(addr);
 }
 
 export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: () => object): Promise<ServerHandle> {
@@ -68,21 +103,49 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
         const path = (req.url ?? '/').split('?')[0] ?? '/';
 
         if (path === '/gh/health') {
-          if (req.method !== 'GET') { send(res, 405, { status: 'error', message: 'GET only' }); return; }
+          // HEAD is GET without a body — a monitoring probe that sends one is not making a
+          // bad request. Node suppresses the body for HEAD on its own.
+          if (req.method !== 'GET' && req.method !== 'HEAD') { send(res, 405, { status: 'error', message: 'GET only' }); return; }
           send(res, 200, health());
           return;
         }
 
         if (path === '/v1') {
           if (req.method !== 'POST') { send(res, 405, { status: 'error', message: 'POST only' }); return; }
-          const raw = await readBody(req);
+          const read = await readBody(req);
+          if (read.tooLarge) {
+            // Answer first, hang up second — and the hang-up has to be an orderly one.
+            // Destroying the socket while the client is still uploading closes it with unread
+            // inbound data, which makes the OS send RST rather than FIN, and an RST discards
+            // the response still sitting in the client's receive buffer: it observes
+            // ECONNRESET, i.e. "solver unavailable", instead of the 500 we just wrote.
+            // (Measured — the destroy-on-finish shape fails this way every time.)
+            //
+            // So: stop buffering, write the reply, then drain a bounded remainder so the
+            // close is a FIN. Only a client that keeps pushing past that gets cut off, and by
+            // then it has long since had its 500.
+            req.pause();
+            res.on('finish', () => {
+              let drained = 0;
+              req.on('data', (c: Buffer) => {
+                drained += c.length;
+                if (drained > MAX_DRAIN_BYTES) req.destroy();
+              });
+              req.resume();
+            });
+            const tooLarge = fail(deps, deps.now(), `request body exceeds ${MAX_BODY_BYTES} bytes`);
+            send(res, tooLarge.httpStatus, tooLarge.body);
+            return;
+          }
           let parsed: unknown;
           try {
-            parsed = JSON.parse(raw);
+            parsed = JSON.parse(read.text);
           } catch {
             // Deliberately the FlareSolverr error shape rather than a 400: any non-2xx is the
-            // signal a FlareSolverr client already degrades on.
-            send(res, 500, { status: 'error', message: 'request body was not valid JSON', startTimestamp: deps.now(), endTimestamp: deps.now(), version: deps.version });
+            // signal a FlareSolverr client already degrades on. Built by v1's own `fail` so the
+            // two cannot drift.
+            const bad = fail(deps, deps.now(), 'request body was not valid JSON');
+            send(res, bad.httpStatus, bad.body);
             return;
           }
           const { httpStatus, body } = await handleV1(parsed, deps);
@@ -102,9 +165,12 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
     const onError = (err: NodeJS.ErrnoException) => {
       server.removeListener('listening', onListening);
       if (err.code === 'EADDRINUSE') {
+        const flareSolverr = cfg.port === 8191
+          ? `Port 8191 is FlareSolverr's own — if a real FlareSolverr is running, stop it or ` +
+            `set GATEHOUSE_PORT to run both. `
+          : '';
         reject(new PortInUseError(
-          `port ${cfg.port} on ${cfg.bind} is already in use. Port 8191 is FlareSolverr's own — ` +
-            `if a real FlareSolverr is running, stop it or set GATEHOUSE_PORT to run both. ` +
+          `port ${cfg.port} on ${cfg.bind} is already in use. ${flareSolverr}` +
             `Refusing to fall back to another port: the two are indistinguishable on the wire, ` +
             `so a silent move would leave it unclear which one your client is talking to.`,
         ));
@@ -119,11 +185,31 @@ export async function startServer(cfg: GatehouseConfig, deps: V1Deps, health: ()
     server.listen(cfg.port, cfg.bind);
   });
 
-  const port = (server.address() as AddressInfo).port;
+  // `onError` is gone and this is a daemon: a `net.Server` with no `error` listener throws on
+  // the next accept-time failure (EMFILE/ENFILE are realistic for a process that also spawns
+  // browsers) and takes the process with it. Log it and stay up.
+  server.on('error', (e: Error) => log.error('server error', { message: e.message }));
+
+  const address = server.address() as AddressInfo;
+  const port = address.port;
+
+  // The auth gate exempts loopback on the strength of `cfg.bind`, a string. What is actually
+  // reachable is what `listen` bound — `localhost` goes through DNS/hosts and need not land
+  // on 127.0.0.1. If they disagree and there is no token, nothing is guarding the door.
+  if (!boundToLoopback(address.address) && !cfg.token) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw new ConfigError(
+      `GATEHOUSE_BIND=${cfg.bind} resolved to ${address.address}, which is reachable off-box, ` +
+        `and no GATEHOUSE_TOKEN is set. Refusing to serve an unauthenticated browser driver: ` +
+        `the loopback exemption applies to the address actually bound, not the name asked for.`,
+    );
+  }
+
   log.info(`listening on http://${cfg.bind}:${port}`);
 
   return {
     port,
+    server,
     close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
   };
 }
