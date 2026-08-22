@@ -259,7 +259,7 @@ Create `test/unit/store.test.ts`:
 
 ```ts
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DownloadStore } from '../../src/downloads/store.js';
@@ -380,13 +380,51 @@ describe('DownloadStore', () => {
     expect(s.get(a.id)?.lastAccessAt).toBe(7777);
   });
 
-  it('writes the manifest atomically, leaving no tmp file behind', async () => {
+  // NOTE (corrected during review): the test below does NOT test atomicity — it survives a
+  // mutant that writes in place with no tmp and no rename. Keep it under this honest name,
+  // and pin atomicity separately with `stat().ino`: a rename swaps in a different file
+  // object, an in-place write keeps the same one. No mocking required.
+  it('writes a manifest that parses and leaves no tmp behind', async () => {
     const s = mk(); await s.load();
     await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
     const files = await readdir(dir);
     expect(files).toContain('manifest.json');
     expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([]);
     JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')); // must parse
+  });
+
+  it('writes the manifest atomically', async () => {
+    const s = mk(); await s.load();
+    await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
+
+    const p = join(dir, 'manifest.json');
+    const before = await stat(p);
+    await s.create({ url: 'http://x.test/b', session: 'x.test', referer: null });
+    const after = await stat(p);
+
+    // A rename swaps in a different file object; an in-place write would keep the same one.
+    expect(after.ino).not.toBe(before.ino);
+  });
+
+  it('demotes a running record to failed on restart', async () => {
+    const s = mk(); await s.load();
+    const a = await s.create({ url: 'http://x.test/a', session: 'x.test', referer: null });
+    await s.update(a.id, { state: 'running', received: 40 });
+
+    // The process that owned that transfer is gone. A stale `running` record would wedge its
+    // session+url pair forever, because findOpen would keep deduping onto a job nothing runs.
+    const s2 = mk(); await s2.load();
+    const back = s2.get(a.id)!;
+    expect(back.state).toBe('failed');
+    expect(back.error?.code).toBe('cancelled');
+    expect(back.completedAt).not.toBeNull(); // or its TTL would run from when it STARTED
+    expect(s2.findOpen('x.test', 'http://x.test/a')).toBeUndefined();
+  });
+
+  it('refuses a path-unsafe id', () => {
+    const s = mk();
+    expect(() => s.filePath('../../x')).toThrow();
+    expect(() => s.partPath('..')).toThrow();
   });
 });
 ```
