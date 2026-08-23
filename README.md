@@ -339,6 +339,42 @@ you took the local `path` and have not copied or moved the file yet, it can vani
 or `DELETE` it when you are done, or raise the TTL. An unsettled record is never swept, at
 any age or size.
 
+### Live verification, 2026-08-22: `/gh/fetch` does not work against a fingerprinting host
+
+This was run against a real Cloudflare-protected file, and **it failed**. The result is worth
+stating precisely, because it inverts an assumption in the design.
+
+Immediately after a successful solve, with a valid `cf_clearance` in the partition:
+
+| how the bytes were requested | result |
+|---|---|
+| `net.request({session})` | **403** — 5,851 bytes of interstitial |
+| `net.request({session, useSessionCookies: true})` | **403** |
+| `net.request({session, credentials: 'include'})` | **403** |
+| `net.request` + the window's exact `User-Agent` | **403** |
+| `webContents.downloadURL` → `will-download` | **completed, 10,759,939 bytes** of real content |
+
+Two things came out of that.
+
+**`useSessionCookies` defaults to `false`.** Passing a `session` to `net.request` buys the
+partition's network stack but *not* its cookie jar, so the clearance was never being sent at
+all. Fixed — but it turned out to be necessary rather than sufficient.
+
+**The design has its two mechanisms the wrong way round.** It calls `net.request` the normal
+path and `will-download` "the escape hatch for a URL that only materialises from a page
+action". Against a host that fingerprints, the escape hatch is the *only* path that works:
+Cloudflare tells the `net` client from the renderer even with the same partition, the same
+cookie and the same User-Agent.
+
+What is **not** being done about that: hand-forging Chrome's header set onto `net.request`.
+That is fingerprint-mimicry, which this project rules out, and it would break the next time
+Cloudflare retunes. Driving the browser's own download stack is both the honest answer and the
+durable one.
+
+So today `/gh/fetch` works against an ordinary host and fails against a challenge-protected
+one — which is most of the reason it exists. Treat it as unfinished until the
+browser-initiated path lands.
+
 ### What is not proven about downloading
 
 The download path has **never been run against a real content source, and never against a
