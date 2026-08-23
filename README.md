@@ -367,6 +367,23 @@ you took the local `path` and have not copied or moved the file yet, it can vani
 or `DELETE` it when you are done, or raise the TTL. An unsettled record is never swept, at
 any age or size.
 
+### Live verification, 2026-08-23: `/gh/fetch` works end to end
+
+Re-run against the same real Cloudflare-protected file that the previous engine could not
+fetch, on a session solved moments earlier:
+
+| step | result |
+|---|---|
+| `/v1` regression | `ok`, `cf_clearance` present, 4.8s |
+| `POST /gh/fetch` | **`done`** — 10,759,939 bytes |
+| content | real JSON, 8,679 entries — not an interstitial |
+| `sha256` | independently hashed from the file on disk, matches the reported digest |
+| `GET /gh/files/:id` | 200, byte-identical to disk |
+| `Range: bytes=100-199` | 206, `content-range: bytes 100-199/10759939`, byte-equal slice |
+| `DELETE /gh/jobs/:id` | 204, then 404, and the file gone from disk |
+
+The measurement that forced this engine is kept below, because it is the reason it exists.
+
 ### Live verification, 2026-08-22: only the browser's own download stack gets the bytes
 
 This was run against a real Cloudflare-protected file, and the `net.request` path **failed**.
