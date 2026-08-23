@@ -1,11 +1,21 @@
 import { stat, rm, rename } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import type { BrowserWindow, DownloadItem, Event, Session, WebContents } from 'electron';
 import type { DownloadStore } from './store.js';
 import type { DownloadRecord, FailureCode } from './record.js';
 import { planResume } from './resumable.js';
 import { STALLED } from './stalled.js';
+import {
+  runRecipe,
+  isRecipeError,
+  STEP_CHANNEL,
+  RESULT_CHANNEL,
+  type Recipe,
+  type RecipeStep,
+  type StepResult,
+} from './recipe.js';
+import { validateTarget, isTargetError } from '../api/target.js';
 import { log } from '../log.js';
 
 /**
@@ -20,16 +30,92 @@ import { log } from '../log.js';
  */
 export const PROGRESS_BYTES = 4 * 1024 * 1024;
 
+/**
+ * How long past a step's own deadline the main process waits before declaring the bridge silent.
+ *
+ * Both halves race the same absolute deadline: the page polls to it and answers "matched
+ * nothing within the step timeout", and this side times out in case that answer never comes.
+ * Without the grace the two are a photo finish and the *wiring* message wins about half the
+ * time — telling an operator the bridge may be broken when in truth the selector matched
+ * nothing. One IPC round trip on loopback is sub-millisecond; this is three orders of magnitude
+ * of slack, and it is bounded, which is the property that actually matters.
+ */
+const BRIDGE_GRACE_MS = 500;
+
+/**
+ * The longest attribute value a recipe may derive and still have it treated as a URL.
+ *
+ * Chosen against what actually exists rather than against a spec: no HTTP stack in wide use
+ * accepts a request line past about 8KB (IIS and nginx both stop around there), and browsers
+ * themselves cap a navigable URL near 32KB, so 8192 is comfortably past every download link a
+ * site could legitimately mint and comfortably short of a `data:` URI holding an image. What it
+ * bounds is not the fetch — `validateTarget` refuses anything but http(s) anyway — but the
+ * ERROR MESSAGE: a rejection quotes what it refused, and that string is persisted into the
+ * manifest and served back from `/gh/jobs/:id`.
+ */
+const MAX_DERIVED_URL = 8192;
+
+/**
+ * The main-process half of the recipe bridge — `ipcMain`, structurally.
+ *
+ * Injected rather than imported for the reason the whole module keeps `import type` from
+ * electron: `test/unit/browser.test.ts` loads this file outside an Electron runtime, where
+ * `ipcMain` is undefined, and an import of it as a *value* would take that suite down at load.
+ */
+export interface RecipeIpc {
+  on(channel: string, listener: (event: { sender: { id: number } }, ...args: unknown[]) => void): void;
+  removeListener(channel: string, listener: (event: { sender: { id: number } }, ...args: unknown[]) => void): void;
+}
+
+/** Everything the recipe branch needs. Absent on an ordinary download, which is most of them. */
+export interface RecipeRun {
+  recipe: Recipe;
+  /** Per step; the page polls to whichever of the two remaining budgets is smaller. */
+  stepMs: number;
+  /** Across the whole recipe. */
+  totalMs: number;
+  /**
+   * Absolute path of the preload that answers the step channel.
+   *
+   * Checked for existence before the window is made, because a missing preload fails
+   * SILENTLY: measured, the window loads, the page renders, the renderer stays alive,
+   * `preload-error` fires, and every step then hangs waiting for a listener that was never
+   * attached. A wiring fault must not present as a site that stopped responding.
+   */
+  preload: string;
+  ipc: RecipeIpc;
+}
+
 export interface BrowserDownloadDeps {
   store: DownloadStore;
   /** The partition that solved the challenge — the cookies and fingerprint come with it. */
   partitionFor: (session: string) => Session;
-  /** A hidden window on that partition, owned by this call and destroyed by it. */
-  makeWindow: (session: string) => BrowserWindow;
+  /**
+   * A hidden window on that partition, owned by this call and destroyed by it. `preload` is the
+   * recipe bridge's absolute path for a recipe download, and `null` for every other one — an
+   * ordinary download loads no page and needs no bridge in its renderer.
+   */
+  makeWindow: (session: string, preload: string | null) => BrowserWindow;
   /** How long to wait for `will-download` to fire at all before giving up. */
   noStartMs: number;
   /** How long `receivedBytes` may sit still before the transfer is judged stalled. */
   stallMs: number;
+  /**
+   * Called once, at the moment a download item is adopted — the transfer has begun.
+   *
+   * It exists for the idle watchdog outside this module, whose clock would otherwise span
+   * everything that happened FIRST: the window, the page load, and on a recipe every step. At
+   * the defaults those add up exactly — `recipeTotalMs` (60s) plus `noStartMs` (60s) is
+   * `stallMs` (120s) to the millisecond — so a recipe that legitimately took its time would
+   * race the watchdog and could settle `network`/"stopped advancing" about a transfer that had
+   * only just started. Restarting the clock here makes the stall window measure what its
+   * message describes: an item that exists and has stopped moving.
+   *
+   * Optional: the callers that do not run a watchdog (every unit test) pass nothing.
+   */
+  onItemAdopted?: () => void;
+  /** Present only when this job's URL has to be derived by driving a page first. */
+  recipe?: RecipeRun;
 }
 
 /** A thrown value into a `FailureCode`, matching the convention the job queue already uses. */
@@ -95,6 +181,24 @@ async function hashFile(path: string): Promise<string> {
  * would then fold every re-POST onto. Everything that can throw is inside the try/catch, and
  * `store.update` swallows its own persistence failures, so no settle can reject on the way out.
  *
+ * **A recipe puts a page in front of all of that, and its ordering is load-bearing.** The window
+ * is created with the bridge preload, `will-download` is attached **before anything navigates**,
+ * and only then does the window load `startUrl` and the steps run. Attaching that handler later
+ * is not a smaller version of the same thing: an item nobody claims is Chromium's to dispose of
+ * as it sees fit, and neither of the two things it then does is acceptable — the documented one
+ * is a native modal Save As dialog that never resolves, fatal on a daemon; the one MEASURED here
+ * (Electron 43.4.1, Windows 11 26200) is quieter and in one way worse, the whole file written
+ * into the user's own Downloads folder under a UUID `.tmp` name, outside the store, outside
+ * retention and reported nowhere. See the handler itself for the measurement. A `click` step is
+ * entirely free to start a download itself, too — which is also the second legitimate way a
+ * recipe ends: if an item arrives mid-recipe it **is** the result, the remaining steps are
+ * abandoned, and no `readAttribute` needs to have produced anything. And a page may start MORE
+ * than one, which is why the handler claims every item rather than only its first.
+ *
+ * The URL a recipe derives is hostile input and goes through `validateTarget` here, on the way
+ * out. `runRecipe` returns it deliberately unvalidated so that gate cannot be skipped by
+ * accident; do not move it.
+ *
  * **A record settles only after the writer released the file.** Chromium is the writer here and
  * its `done` event is the release, so every settle that concerns a file that was actually opened
  * happens inside that handler. The settles outside it — cancelled before the start, never
@@ -145,6 +249,23 @@ export async function browserDownload(
   // to `null` for good and make the releases in the `finally` uncallable.
   let detachWillDownload: (() => void) | undefined;
   let detachAbort: (() => void) | undefined;
+  let detachPreloadError: (() => void) | undefined;
+
+  /**
+   * The bridge's shared state, in an object rather than in two `let`s.
+   *
+   * Both fields are written from nested callbacks and read from another, which is precisely the
+   * shape TypeScript's control-flow analysis cannot follow: a `let` narrowed to `null` at the
+   * point a closure is created stays narrowed inside it. A property has no such narrowing, so
+   * this reads as what it is — mutable state shared between the preload-error listener, the
+   * download adopter and whichever step is currently in flight.
+   */
+  const bridge: {
+    /** Set once `preload-error` has fired: the bridge in this renderer will never answer. */
+    failure: string | null;
+    /** Abandon the step currently in flight, with a reason. Null when no step is waiting. */
+    abandon: ((why: string) => void) | null;
+  } = { failure: null, abandon: null };
 
   try {
     const part = deps.store.partPath(id);
@@ -246,18 +367,79 @@ export async function browserDownload(
       received: plan.kind === 'resume' ? partial : 0,
     });
 
+    /**
+     * A recipe that is not here any more.
+     *
+     * Recipes live in memory beside the record, never on it, so a restart loses them. The
+     * requeue path picks a record back up by id and this one's `url` is the *page*, not the
+     * file — so a restart that could not resume the partial would "start over" by downloading
+     * the HTML and settling `done` on it. That is a silent wrong answer, which is worth failing
+     * loudly for. A resume is unaffected: it continues from the URL chain the derived download
+     * already recorded, and never looks at `rec.url` at all.
+     */
+    if (rec.viaRecipe && plan.kind === 'restart' && !deps.recipe) {
+      log.warn('a recipe download cannot be restarted without its recipe', { id, url: rec.url });
+      await finish(failedPatch(
+        'recipe-failed',
+        'this download was derived from a recipe, which is not persisted across a restart; ' +
+          'POST the recipe again to fetch it',
+      ));
+      return;
+    }
+
+    // A missing preload is the wiring fault that presents as a hanging site — the window loads,
+    // the page renders, `preload-error` fires and every step waits for a listener that is not
+    // there. Refuse before opening anything, and say which file.
+    if (deps.recipe && plan.kind === 'restart' && !existsSync(deps.recipe.preload)) {
+      log.error('the recipe bridge preload is missing', { id, preload: deps.recipe.preload });
+      await finish(failedPatch(
+        'recipe-failed',
+        `the recipe bridge preload is missing at ${deps.recipe.preload}; this app is mis-wired, ` +
+          `not the site`,
+      ));
+      return;
+    }
+
     // A resume needs no window, and must not be given one — `createInterruptedDownload` is a
     // session API and would ignore it.
-    if (plan.kind === 'restart') win = deps.makeWindow(rec.session);
+    if (plan.kind === 'restart') win = deps.makeWindow(rec.session, deps.recipe?.preload ?? null);
     // Captured once. Reading `win.webContents` later, after the window is destroyed, throws
     // from inside an emit — an uncaught exception in a daemon. The reference itself stays safe
     // to compare forever.
     const ownWebContents: WebContents | null = win ? win.webContents : null;
 
+    /**
+     * The second half of designing out the silent hang.
+     *
+     * A preload that exists but cannot be loaded — a syntax error, an `import` statement in a
+     * sandboxed CommonJS file, a permission fault — does not stop the window, does not stop the
+     * page and does not throw anywhere we would see it. It fires this, once, and then every
+     * step waits forever. So the reason is captured the moment it happens and the step in flight
+     * is abandoned with it, rather than being left to discover the silence for itself.
+     */
+    if (deps.recipe && ownWebContents) {
+      const wc = ownWebContents;
+      const onPreloadError = (_e: Event, preloadPath: string, error: Error): void => {
+        const why = `the recipe bridge failed to load (${preloadPath}: ${error?.message ?? String(error)})`;
+        bridge.failure = why;
+        log.error('the recipe preload failed to load', { id, preload: preloadPath, reason: error?.message ?? String(error) });
+        bridge.abandon?.(why);
+      };
+      wc.on('preload-error', onPreloadError);
+      detachPreloadError = (): void => { wc.removeListener('preload-error', onPreloadError); };
+    }
+
     await new Promise<void>((resolve) => {
       /** Wire an item we have decided is ours, and settle from its `done`. */
       const adopt = (dl: DownloadItem): void => {
         item = dl;
+        // The transfer has begun: whatever bounded the phases before it is done, and the idle
+        // watchdog's window should start from here rather than from the job's submission.
+        deps.onItemAdopted?.();
+        // The recipe's second legitimate ending: a `click` started the download itself, so this
+        // item IS the result and the remaining steps are pointless. Abandoning the step in
+        // flight is what makes that immediate instead of one step timeout later.
+        bridge.abandon?.('was abandoned because a download started while the recipe was running');
 
         let lastReported = receivedOf(dl);
         const onUpdated = (): void => {
@@ -392,6 +574,9 @@ export async function browserDownload(
           }
           return;
         }
+        // A recipe may be mid-step. The settle below does not wait for it, but leaving the step
+        // to discover the cancellation on its own deadline keeps a dead window alive for it.
+        bridge.abandon?.('was abandoned because the download was cancelled');
         // Nothing has started, so nothing will ever end this wait but us.
         const done = signal.reason === STALLED ? settleStalled(partial) : settleCancelled();
         void done.then(resolve, resolve);
@@ -445,51 +630,289 @@ export async function browserDownload(
           return;
         }
 
+        /**
+         * How many items past the first this window has produced. Only ever used to make the
+         * throwaway save path below unique, so two discarded items cannot name one file.
+         */
+        let extras = 0;
+
         const onWillDownload = (_e: Event, dl: DownloadItem, from: WebContents): void => {
           // The ONLY reliable correlation on this path. `from` is `null` for any resume in
           // flight, and another job's window for any sibling, so both fall out here.
           if (from !== ownWebContents) return;
-          // MUST be synchronous. With no save path Chromium opens a native modal Save As dialog
-          // and the download never completes — fatal for a daemon. Measured: synchronous, a
-          // microtask and `setTimeout(0)` all work; `setTimeout(300)` is silently ignored and
-          // hangs. So this comes first, even in the give-up case below, where it is what stops
-          // a late arrival raising a dialog nobody will ever click.
-          dl.setSavePath(part);
-          if (settled) {
-            // The no-start timer already gave up on this download; do not resurrect the record.
+
+          /**
+           * EVERY item this window produces is claimed, not just the first, and the listener
+           * therefore stays attached for the window's whole life.
+           *
+           * A page is free to start more than one download: two iframes, a click handler that
+           * fires twice, a document that loops `location.href`. A recipe puts exactly such a
+           * page on this path, which increment 2b never did. Detaching after the first item —
+           * which is what this used to do — leaves every later one unclaimed, because a sibling
+           * job's listener sees the wrong `webContents` and returns above. Nothing then calls
+           * `setSavePath`, and Chromium falls back to its own default download routine.
+           *
+           * **What that fallback actually does was measured, and it is not what this code was
+           * written expecting.** The design says an unclaimed item raises the native modal Save
+           * As dialog and wedges the process. On Electron 43.4.1 / Windows 11 26200 it does not:
+           * with the fix reverted and a page starting two downloads, the job completed normally
+           * and the second item was written **in full into the user's own Downloads folder**,
+           * under a UUID `.tmp` name. Silent, outside the store, invisible to retention and to
+           * `/gh/jobs/:id`, and unbounded — one such file per extra item, forever, on a daemon.
+           * Bad in a quieter way than a hang, and worse in one respect: nothing reports it.
+           *
+           * The modal is not therefore hypothetical — it is documented Electron behaviour and
+           * depends on the platform's download prefs — so both hazards are designed out by the
+           * same rule, and neither is relied on: give EVERY item a save path (synchronously —
+           * measured, a `setTimeout(300)` is already too late), then keep the first and cancel
+           * the rest.
+           */
+          if (item || settled) {
+            /**
+             * NOT `part`. Chromium DELETES the file of an item it cancelled, and `part` is the
+             * adopted item's live, still-being-written file — pointing a doomed item at it
+             * would delete the download we are keeping. A path of its own is a path Chromium
+             * may delete freely.
+             *
+             * `settled` with no item reaches here too (the no-start timer gave up, and a late
+             * arrival must not resurrect the record); it takes the same throwaway path rather
+             * than a second rule, because "an item we are not keeping never names our file" is
+             * the property worth having in one piece.
+             */
+            extras += 1;
+            dl.setSavePath(`${part}.extra-${extras}`);
             dl.cancel();
+            log.warn('discarded an extra download item from this window', {
+              id, extras, adopted: item !== null,
+            });
             return;
           }
-          ses.removeListener('will-download', onWillDownload);
+          dl.setSavePath(part);
           adopt(dl);
           recordHeaders(dl);
         };
         detachWillDownload = (): void => { ses.removeListener('will-download', onWillDownload); };
         ses.on('will-download', onWillDownload);
 
-        // A host that accepts the socket and then says nothing never fires `will-download` at
-        // all — measured at 150s with no timeout, no error and nothing to cancel. This timer is
-        // the only thing that ends that. The idle watchdog would eventually fire too — it seeds
-        // its clock unconditionally, so it does not need `received` to have moved — but this
-        // timer is a tighter bound and, unlike a stall, it names the fault: nothing ever began.
-        noStart = setTimeout(() => {
-          if (item) return; // it started; the idle watchdog owns it from here
-          log.warn('download never started', { id, noStartMs: deps.noStartMs });
-          void finish(
-            failedPatch(
-              'network',
-              `the download never started within ${deps.noStartMs}ms`,
-            ),
-          ).then(resolve, resolve);
-        }, deps.noStartMs);
-        noStart.unref?.();
+        /**
+         * Ask for the file, and start bounding the request phase at the same moment.
+         *
+         * A host that accepts the socket and then says nothing never fires `will-download` at
+         * all — measured at 150s with no timeout, no error and nothing to cancel. That timer is
+         * the only thing that ends it. The idle watchdog would eventually fire too — it seeds
+         * its clock unconditionally, so it does not need `received` to have moved — but this
+         * timer is a tighter bound and, unlike a stall, it names the fault: nothing ever began.
+         *
+         * On a recipe it is armed AFTER the steps, not in front of them, and that placement is
+         * deliberate. The recipe has budgets of its own; counting a page's polling against a
+         * window that measures the request phase would, at the defaults, have a 60s recipe race
+         * a 60s no-start window and report "the download never started" about a recipe that was
+         * still working.
+         */
+        const startDownload = (url: string): void => {
+          noStart = setTimeout(() => {
+            if (item) return; // it started; the idle watchdog owns it from here
+            log.warn('download never started', { id, noStartMs: deps.noStartMs });
+            void finish(
+              failedPatch(
+                'network',
+                `the download never started within ${deps.noStartMs}ms`,
+              ),
+            ).then(resolve, resolve);
+          }, deps.noStartMs);
+          noStart.unref?.();
 
-        // The referer the caller gave us, for a host that checks it. Page content never
-        // reaches this: it is a header value, not script and not a path.
-        ownWebContents!.downloadURL(
-          rec.url,
-          rec.referer ? { headers: { referer: rec.referer } } : undefined,
-        );
+          // The referer the caller gave us, for a host that checks it. Page content never
+          // reaches this: it is a header value, not script and not a path. A recipe never has
+          // one — the browser sets its own by navigating to `startUrl`.
+          ownWebContents!.downloadURL(
+            url,
+            rec.referer ? { headers: { referer: rec.referer } } : undefined,
+          );
+        };
+
+        const run = deps.recipe;
+        if (!run) {
+          startDownload(rec.url);
+          return;
+        }
+
+        const wc = ownWebContents!;
+        const failRecipe = (message: string): void => {
+          log.warn('recipe failed', { id, startUrl: run.recipe.startUrl, reason: message });
+          void finish(failedPatch('recipe-failed', message)).then(resolve, resolve);
+        };
+
+        /**
+         * Send one step to the page and await its answer, **racing that answer against the
+         * step's own deadline**.
+         *
+         * `runRecipe` measures time between steps and nothing at all during one, and says so:
+         * it holds no timer that could cancel a promise it did not create, so a `send` that
+         * never settles hangs the recipe past every deadline in that module, forever, holding
+         * a download slot. A preload that fails to load produces exactly that — measured — so
+         * the timer below is not belt-and-braces, it is the only bound there is.
+         *
+         * The loser of the race is DROPPED, never thrown: a reply that arrives after the
+         * timeout finds the step already settled and is ignored, because rejecting it would
+         * surface as an unhandled rejection out of a `void`ed job path.
+         */
+        let seq = 0;
+        const send = (step: RecipeStep, deadlineMs: number): Promise<StepResult> =>
+          new Promise<StepResult>((resolveStep) => {
+            const mine = ++seq;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            let answered = false;
+
+            /** First answer wins. Everything after it — a late reply included — is dropped. */
+            const settleStep = (result: StepResult): void => {
+              if (answered) return;
+              answered = true;
+              if (timer !== undefined) clearTimeout(timer);
+              run.ipc.removeListener(RESULT_CHANNEL, onResult);
+              bridge.abandon = null;
+              resolveStep(result);
+            };
+
+            /**
+             * `(seq, result)` — the reply shape the preload sends, filtered twice.
+             *
+             * On the SENDER first: `ipcMain` is process-wide, so every concurrent recipe
+             * window answers on this one channel and a sibling's reply would otherwise be read
+             * as ours — a job settling on another job's derived URL, which is not something an
+             * operator could ever diagnose from a log line. Two recipe downloads running at
+             * once is ordinary, so this filter is load-bearing today; the two-window test in
+             * `test/unit/recipe-bridge.test.ts` is what holds it.
+             *
+             * Then on the SEQUENCE, which is defence in depth rather than a live guard. The
+             * hazard it describes — a reply arriving after its own step timed out, handed to
+             * the NEXT step as if it were about that step's selector — is unreachable as the
+             * code stands: a timed-out step settles `{ ok: false }` and `runRecipe` returns on
+             * the first non-ok result, so there is no later step for a stale reply to land on.
+             * It stays because that unreachability rests entirely on one decision in
+             * `runRecipe`; a step timeout that ever stopped being fatal would make a stale
+             * reply readable as the next step's answer, silently. What the check does earn
+             * today is the narrower half of the same rule, which `test/unit/recipe-bridge.test.ts`
+             * pins: a late reply for an already-settled step is dropped rather than thrown.
+             */
+            const onResult = (event: { sender: { id: number } }, ...args: unknown[]): void => {
+              if (event.sender.id !== wc.id) return;
+              if (args[0] !== mine) return;
+              settleStep(args[1] as StepResult);
+            };
+
+            run.ipc.on(RESULT_CHANNEL, onResult);
+            timer = setTimeout(() => {
+              settleStep({
+                ok: false,
+                error: bridge.failure
+                  ?? `got no answer from the page bridge within ${run.stepMs}ms`,
+              });
+            }, Math.max(0, deadlineMs - Date.now()) + BRIDGE_GRACE_MS);
+            // A step's timer must never be the reason a daemon stays alive on the way out.
+            timer.unref?.();
+
+            // Already known dead: do not spend a whole step deadline rediscovering it.
+            if (bridge.failure !== null) { settleStep({ ok: false, error: bridge.failure }); return; }
+            bridge.abandon = (why) => { settleStep({ ok: false, error: why }); };
+
+            try {
+              // `(seq, step, deadline)` — the outbound shape the preload's handler destructures.
+              // The step crosses as STRUCTURED DATA: no caller string is ever built into code.
+              wc.send(STEP_CHANNEL, mine, step, deadlineMs);
+            } catch (e: unknown) {
+              settleStep({ ok: false, error: `could not be sent to the page (${e instanceof Error ? e.message : String(e)})` });
+            }
+          });
+
+        void (async (): Promise<void> => {
+          try {
+            try {
+              await wc.loadURL(run.recipe.startUrl);
+            } catch (e: unknown) {
+              // ENDING TWO AGAIN, and it is checked FIRST here for the same reason it is after
+              // the steps: a download can be adopted DURING the load — the `duringLoad` fixture
+              // is exactly that — and a page is free to fail its main document afterwards on
+              // purpose. Failing the record then would settle `recipe-failed` while the bytes
+              // are still arriving, and the completed file would be renamed into place against
+              // a failed record: the wrong verdict plus an orphaned `.bin`.
+              if (item) return;
+              // Chromium rejects with ERR_NAME_NOT_RESOLVED and friends. The page never came
+              // up, so no step could have run — say that rather than blaming a selector.
+              if (!settled) {
+                failRecipe(`could not load ${run.recipe.startUrl} (${e instanceof Error ? e.message : String(e)})`);
+              }
+              return;
+            }
+            if (settled) return;
+
+            const derived = await runRecipe(run.recipe, {
+              send,
+              stepMs: run.stepMs,
+              totalMs: run.totalMs,
+              now: () => Date.now(),
+            });
+
+            // ENDING TWO, and it is checked FIRST — before the recipe's own verdict. A `click`
+            // that started the download itself makes that item the result; the step it was in
+            // the middle of was abandoned rather than completed, so `derived` is an error here
+            // and reporting it would fail a job whose bytes are already arriving.
+            if (item) return;
+            if (settled || signal.aborted) return;
+
+            if (isRecipeError(derived)) { failRecipe(derived.message); return; }
+
+            /**
+             * `getAttribute` returns the attribute verbatim, and a site's download link is as
+             * likely to read `/download/12345` as it is to be absolute. Resolve it against the
+             * page it was read off, which is what the browser itself would do with that href.
+             *
+             * This cannot widen the gate below. An absolute value keeps its own scheme —
+             * `file:///C:/Windows/win.ini` resolves to itself — and a relative one can only
+             * inherit http(s) from a page we navigated to. Everything still goes through
+             * `validateTarget` either way.
+             */
+            /**
+             * The length gate, BEFORE anything parses or echoes the value.
+             *
+             * An attribute is whatever the site put in it, and `href` has no length limit —
+             * a `data:` URI holding a multi-megabyte image is ordinary markup. Every rejection
+             * below quotes the value it refused, and that message goes into the record, into
+             * the manifest that is rewritten on every progress tick, and back out of
+             * `/gh/jobs/:id`. So a value too long to be a URL we would fetch is refused by its
+             * SIZE and never quoted, rather than being carried through the system verbatim.
+             */
+            if (derived.url.length > MAX_DERIVED_URL) {
+              failRecipe(
+                `the recipe derived a value of ${derived.url.length} characters, which is past ` +
+                  `the ${MAX_DERIVED_URL} a URL we would fetch can be; it is not quoted here`,
+              );
+              return;
+            }
+
+            const base = wc.getURL() || run.recipe.startUrl;
+            let absolute = derived.url;
+            try { absolute = new URL(derived.url, base).href; } catch { /* validateTarget names it */ }
+
+            // THE DERIVED URL IS HOSTILE INPUT. It came off a page's attribute, so it is a
+            // caller-and-site-controlled string, and `file:///C:/Windows/win.ini` parses
+            // perfectly. `runRecipe` returns it unvalidated on purpose so this gate cannot be
+            // skipped by accident — do not move it up into that module.
+            const derivedTarget = validateTarget(absolute, undefined);
+            if (isTargetError(derivedTarget)) {
+              failRecipe(`the recipe derived a URL we will not fetch: ${derivedTarget.message}`);
+              return;
+            }
+
+            log.info('recipe derived a download URL', { id, startUrl: run.recipe.startUrl });
+            startDownload(derivedTarget.url);
+          } catch (e: unknown) {
+            // Nothing may escape this IIFE: it is detached from the promise the outer
+            // try/catch guards, so a throw here is an unhandled rejection in a daemon.
+            if (settled) return;
+            failRecipe(`the recipe could not be run (${e instanceof Error ? e.message : String(e)})`);
+          }
+        })();
       } catch (e: unknown) {
         // A start call that threw. If it managed to hand us an item first, cancel it so
         // Chromium is not left transferring bytes into a record we are about to fail.
@@ -514,6 +937,10 @@ export async function browserDownload(
   } finally {
     if (noStart !== undefined) clearTimeout(noStart);
     detachAbort?.();
+    detachPreloadError?.();
+    // A step still in flight would otherwise hold its `ipcMain` listener until its own deadline,
+    // on a window that is about to be destroyed.
+    bridge.abandon?.('was abandoned because the download finished');
     // The window is destroyed while the session listener is still attached, so a download it
     // somehow starts on the way out still gets a save path instead of a modal dialog.
     if (win && !win.isDestroyed()) win.destroy();

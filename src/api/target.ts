@@ -9,6 +9,24 @@
 const MAX_SESSION_LENGTH = 64;
 
 /**
+ * How much of a rejected URL is echoed back at whoever sent it.
+ *
+ * Every rejection here quotes its input so the sender can see what was read, and that message
+ * is rendered into an HTTP response and — on the download path — persisted into a job record
+ * and the manifest behind it. An unparseable value has no length limit at all (an `href` may
+ * hold a multi-megabyte `data:` URI), so the quote is bounded and the rest is elided. The
+ * decision itself never depends on this: it is made on the whole string above.
+ */
+const MAX_ECHO = 200;
+
+/** The value as a message may quote it: enough to recognise, never enough to be a payload. */
+function echo(value: string): string {
+  return value.length <= MAX_ECHO
+    ? value
+    : `${value.slice(0, MAX_ECHO)}… (${value.length} characters in total)`;
+}
+
+/**
  * A session name becomes a Chromium partition (`persist:<session>`) and from there a
  * directory on disk, so it is restricted to characters that cannot walk out of it.
  */
@@ -24,9 +42,13 @@ export function validSession(value: string): boolean {
   return SESSION_NAME.test(value) && !allDots(value);
 }
 
-/** The value is echoed because the caller sent it; it is a partition label, not a secret. */
+/**
+ * The value is echoed because the caller sent it; it is a partition label, not a secret. It is
+ * echoed BOUNDED, though: this is reached precisely when the value failed a length-capped
+ * pattern, so the thing being quoted is by definition not a session name.
+ */
 export function badSession(value: string): string {
-  return `session must match ${SESSION_NAME.source} and not be all dots: ${value}`;
+  return `session must match ${SESSION_NAME.source} and not be all dots: ${echo(value)}`;
 }
 
 /**
@@ -60,7 +82,7 @@ export function validateTarget(rawUrl: unknown, rawSession: unknown): { url: str
   // The URL is handed to a real browser. Without a scheme allow-list, `file:` turns this into
   // an arbitrary local-file reader that answers over the wire.
   let parsed: URL;
-  try { parsed = new URL(rawUrl); } catch { return { message: `url is not a valid URL: ${rawUrl}` }; }
+  try { parsed = new URL(rawUrl); } catch { return { message: `url is not a valid URL: ${echo(rawUrl)}` }; }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     return { message: `url scheme ${parsed.protocol} is not supported; only http and https are` };
   }

@@ -26,8 +26,9 @@ cookie is presented. That fixture proves the *mechanism* (a real browser clears 
 interstitial, the cookie is captured, the wire shape matches). It cannot prove the
 *premise*, because real Cloudflare fingerprints far more than the fixture does.
 
-So: treat "works against real Cloudflare" as unverified. The remaining acceptance is
-a manual run against a real client and a real protected host.
+So: **on the strength of the suite alone**, treat "works against real Cloudflare" as
+unverified — that acceptance is a manual run against a real client and a real protected
+host, and the live-verification sections below are where those runs are recorded.
 
 ## Requirements
 
@@ -96,6 +97,8 @@ All configuration is environment variables; there is no config file.
 | `GATEHOUSE_DOWNLOAD_MAX_BYTES` | `53687091200` (50 GiB) | Cap on the downloads directory, 1048576–9007199254740991. Least-recently-served completed files evict first. |
 | `GATEHOUSE_DOWNLOAD_STALL_MS` | `120000` (2m) | How long one download may go with **no progress at all** before it is aborted, 5000–3600000. An idle window, not a time limit on the download. |
 | `GATEHOUSE_DOWNLOAD_NO_START_MS` | `60000` (1m) | How long to wait for a download to **begin at all** before giving up, 5000–600000. A different fault from a stall: nothing was ever received, so there is no item and no bytes to name. |
+| `GATEHOUSE_RECIPE_STEP_MS` | `15000` (15s) | How long **one recipe step** may wait for its element, 1000–120000. Handed down to the page, which polls to it, and raced by the main process so a bridge that never answers cannot hang the job. |
+| `GATEHOUSE_RECIPE_TOTAL_MS` | `60000` (1m) | Ceiling on a **whole recipe**, across all its steps, 5000–600000. A step is given the smaller of the two remaining budgets, so the two are deliberately not constrained against each other. |
 
 A bad value is a startup failure with the range in the message, not a silent fallback. That
 includes a relative `GATEHOUSE_DOWNLOADS_DIR`: it would be resolved against whatever directory
@@ -227,6 +230,99 @@ a dropped ranged transfer; across a process restart it comes from the re-queue d
 "Interrupted downloads resume on the next start", which is a different mechanism and still
 applies.
 
+#### Driving a page to get the URL: `recipe`
+
+Some hosts do not publish a download URL at all. The link is minted by a click, it is bound to
+the session that minted it, and it is gone in a minute — so there is nothing a caller can hand
+to `url`. For those, `POST /gh/fetch` takes a **recipe** instead: a short, declarative script
+that Gatehouse runs *inside the browser session that solved the challenge*, and whose last step
+yields the URL it then downloads through that same window.
+
+```json
+{
+  "site": "host.example",
+  "recipe": {
+    "startUrl": "https://host.example/files/12345",
+    "steps": [
+      { "op": "click",         "selector": "button.download", "text": "Download" },
+      { "op": "waitFor",       "selector": "a#dl-link" },
+      { "op": "readAttribute", "selector": "a#dl-link", "attribute": "href" }
+    ]
+  }
+}
+```
+
+There are exactly three verbs, and no more are planned:
+
+| `op` | does | takes |
+|---|---|---|
+| `click` | clicks the first match | `selector`, optional `text` |
+| `waitFor` | polls until a match exists | `selector`, optional `text` |
+| `readAttribute` | reads one attribute off the first match | `selector`, `attribute` |
+
+`text` filters the matches to the one whose trimmed, lower-cased text content equals it —
+"the button that says Download", which survives a class rename in a way a selector alone does
+not. `selector` is CSS, at most 512 characters; a recipe holds at most 12 steps; and it must
+**end with a `readAttribute`**, because that is what produces a URL. Every rejection names the
+step: `recipe step 2: unknown op "type"` is a log line, where "invalid recipe" is an afternoon.
+
+**A caller's selector never becomes code.** The step crosses into the page as structured data
+over IPC and is handed to `querySelectorAll` as an argument. There is no `executeJavaScript` on
+caller input anywhere in this feature, and the bridge that runs the steps lives in a sandboxed,
+context-isolated preload the page cannot see or call.
+
+**`url` and `recipe` are alternatives: provide exactly one.** Neither is a `400`; both is a
+`400` too, rather than a silent preference order — a body carrying both is a caller who
+believes one of the two is doing something, and half of that belief is wrong.
+
+**`referer` is refused alongside a recipe** (`400`). The browser navigates to `startUrl`
+itself and sends whatever `Referer` that navigation implies; a caller-supplied one would be
+either ignored or contradicted, and both are worse than saying so.
+
+The job's record carries the recipe's `startUrl` as its `url`, so dedupe, the logs and
+`GET /gh/jobs/:id` all work unchanged — two `POST`s of the same `startUrl` and `site` fold onto
+one job while it is open, whatever their steps say.
+
+**A recipe can legitimately end two ways.** Usually the last step reads an `href` and that URL
+is downloaded. But a `click` is free to start the download itself, and when it does, that item
+*is* the result: the remaining steps are abandoned and the job completes on the bytes, with no
+`readAttribute` having produced anything.
+
+**A page that starts several downloads gets one job, not several.** The first item the recipe's
+window produces is the job's file; every later one is claimed and cancelled, and the job settles
+on the first. That is not tidiness — an item the app does not claim is Chromium's to dispose of,
+and measured on Electron 43.4.1 / Windows 11 it writes the whole file into the operator's own
+Downloads folder under a UUID `.tmp` name, with no record anywhere, no retention and no bound.
+(The behaviour documented for other platforms is a native modal Save As dialog, which on a
+hidden window in a daemon never resolves at all.) If a site's page genuinely offers two
+different files, a recipe cannot express that: `POST` two jobs.
+
+**The URL a recipe derives is hostile input.** It came off a page, so it goes through the same
+scheme gate every caller URL passes: a derived `file:///C:/Windows/win.ini` is refused, named,
+and never fetched. A relative `href` is resolved against the page it was read from, which
+cannot widen that gate — an absolute value keeps its own scheme.
+
+A step that matches nothing, a recipe that runs out of time, a page bridge that does not answer
+and a derived URL the gate refuses all settle `failed` with code **`recipe-failed`** and a
+message naming the step index and what it was looking for — `step 1 (waitFor a#dl-link) matched
+nothing within the step timeout`.
+
+**Recipes are not persisted.** They are a caller's contract with a site's *markup*, and the
+manifest is a file an operator reads and that is rewritten on every progress tick, so the steps
+live in memory beside the record and die with the process. The consequence is deliberate: a
+recipe download interrupted by a restart is **not** re-derived. If its partial is genuinely
+resumable it continues from the URL already recorded on the item; otherwise the record settles
+`recipe-failed` saying so, and the caller `POST`s the recipe again. The record keeps one bit
+about it — enough to refuse to "restart" a recipe download by downloading the page it began at,
+which would otherwise complete `done` holding HTML.
+
+**The standing risk: a recipe is a selector contract a site is under no obligation to keep.**
+A redesign, an A/B test, or a class name generated by a build will break one, and nothing here
+can prevent that. What the feature does instead is fail *legibly and quickly* — bounded by
+`GATEHOUSE_RECIPE_STEP_MS` and `GATEHOUSE_RECIPE_TOTAL_MS`, with the step and its selector in
+the message — so a broken recipe is a line in a log and an edit to a caller's config, not a
+download that hangs holding a slot.
+
 ### `GET /gh/jobs/:id`
 
 ```json
@@ -249,8 +345,8 @@ completes. On `done` a `result` appears:
 `path` is for a consumer on the same machine that would rather move the file than stream it;
 `url` is for one that would rather stream. `filename` is the name the **remote server**
 suggested and is metadata only — files on disk are always `<id>.bin`, never a remote name.
-On a failure, `error` carries `{code, message}` with `code` one of `network`, `disk-full` or
-`cancelled`. **There is no HTTP status in there**, on any failure: the browser does not expose
+On a failure, `error` carries `{code, message}` with `code` one of `network`, `disk-full`,
+`cancelled` or `recipe-failed` (see the recipe section above). **There is no HTTP status in there**, on any failure: the browser does not expose
 one on a download item, so a 404 arrives indistinguishably as an interrupt with zero bytes and
 no file. `message` is the only detail available, and it is for a human.
 
@@ -371,6 +467,25 @@ you took the local `path` and have not copied or moved the file yet, it can vani
 or `DELETE` it when you are done, or raise the TTL. An unsettled record is never swept, at
 any age or size.
 
+### Live verification, 2026-08-23: recipes work against the site that forced them
+
+romhackplaza mints its download URL from a Livewire click and binds it to the session that
+minted it, so no "derive elsewhere, fetch here" split can reach it. Run through the real app:
+
+| step | result |
+|---|---|
+| `/v1` regression | `ok`, `cf_clearance` present |
+| recipe via `POST /gh/fetch` | **`done`** — 2,215 bytes, `Battletoads -  Extended.zip` |
+| the file | a real ZIP (`PK`), valid archive, 4 entries — not an error page |
+| `sha256` | hashed independently from the file on disk, matches the reported digest |
+| `GET /gh/files/:id` | 200, byte-identical to disk |
+| `Range: bytes=100-199` | 206, `content-range: bytes 100-199/2215`, byte-equal slice |
+| `DELETE /gh/jobs/:id` | 204, then 404, and the file gone from disk |
+
+That byte count is the same one a hand-driven browser probe produced downloading in the session
+that opened the modal — which is the evidence the derive-and-fetch-in-one-session premise
+actually holds, rather than merely being the design.
+
 ### Live verification, 2026-08-23: `/gh/fetch` works end to end
 
 Re-run against the same real Cloudflare-protected file that the previous engine could not
@@ -486,9 +601,30 @@ Two specifics worth knowing before you rely on it. Hashing is a **second pass** 
 finished file rather than a streaming digest, so a large download is read from disk twice
 — deliberate, and now unavoidable: the bytes are written by Chromium, not by us, so there is no
 stream to digest on the way past, and a hash could not survive a resume or a restart anyway. And
-while `will-download` is now how every download is adopted, a **page-action** download — one
-whose URL only materialises when something is clicked — is still not built; a caller must supply
-a final URL.
+while `will-download` is now how every download is adopted, a caller need no longer supply a
+final URL: a **page-action** download — one whose URL only materialises when something is
+clicked — is what `recipe` is for.
+
+**What is not proven about recipes.** The whole feature runs end to end in
+`test/integration/recipe.test.ts` against a local fixture that mimics the measured flow — a
+button that reveals a link after a moment, a button that starts the download itself, one that
+reveals a `file:` URL, one that reveals nothing at all, one whose download starts during the
+page load, and one that starts a second download nobody asked for — through the real spawned
+app, the real preload and a real hidden window. That proves the *mechanism*: the click, the
+poll, the attribute read, both legitimate endings, the scheme gate on the derived URL, the
+handler ordering, the extra item that must be claimed and discarded, and the step timeout as a
+bound rather than a hope.
+
+One real site has been added to that: the run in the live-verification table above fetched a
+real file through a real recipe. **What that is worth is exactly what it says — one site, on
+one day, against that site's markup as it stood.** It is not a claim about recipes in general.
+Nothing here has been run against any other host, so no other site's markup is known to be
+reachable by these three verbs; and the site that was measured is under no obligation to keep
+the `wire:click` handler, the anchor or the attribute the recipe names. A recipe is a selector
+contract the site never agreed to, so a working one can stop working on any deploy, with no
+warning and no error until a job fails. What the design does about that is make the failure
+cheap and legible rather than prevent it: a broken recipe settles `recipe-failed` inside
+`GATEHOUSE_RECIPE_STEP_MS`/`GATEHOUSE_RECIPE_TOTAL_MS`, naming the step and its selector.
 
 ## Test
 

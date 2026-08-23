@@ -32,12 +32,40 @@ export interface GatehouseConfig {
    * stopped advancing instead — true, but less specific. No relationship is enforced because
    * the inversion is genuinely useful: it is how a test reaches the watchdog without sitting
    * through a 60s request phase.
+   *
+   * **A recipe puts a third budget in front of both**, and at the defaults the three meet
+   * exactly: `recipeTotalMs` (60s) + this (60s) = `downloadStallMs` (120s), to the millisecond.
+   * That arithmetic used to matter, because the idle watchdog's clock started when the job did
+   * and therefore ran through the page load and every step — a recipe that legitimately spent
+   * its budget handed the transfer a window of nothing and could settle as one that "stopped
+   * advancing". It no longer does: the watchdog is restarted the moment an item is adopted
+   * (`BrowserDownloadDeps.onItemAdopted`), so the stall window is measured over the transfer
+   * and the three budgets no longer have to be reasoned about together. The pair above is
+   * still an ordering question, and still unconstrained.
    */
   downloadNoStartMs: number;
   /** How long a completed download's bytes survive without being released. */
   downloadTtlMs: number;
   /** Cap on the downloads directory; least-recently-accessed completed files evict first. */
   downloadMaxBytes: number;
+  /**
+   * How long one recipe step may wait for its element before the step fails.
+   *
+   * A *step* budget, not a recipe one: it is handed down to the page, which polls to it, and
+   * the main process races the same deadline so a bridge that never answers cannot hang the
+   * job. A site that reveals its link after an animation needs seconds, not milliseconds; a
+   * selector that will never match should not cost a minute.
+   */
+  recipeStepMs: number;
+  /**
+   * Ceiling on a whole recipe, across all its steps.
+   *
+   * Twelve steps at the default step budget would otherwise be three minutes of held download
+   * slot for a page that has silently changed its markup. The smaller of the two budgets is
+   * what a step is actually given, so a late step cannot spend a full step timeout past the
+   * end of this one.
+   */
+  recipeTotalMs: number;
 }
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -109,5 +137,13 @@ export function loadConfig(env: Record<string, string | undefined>): GatehouseCo
       env.GATEHOUSE_DOWNLOAD_MAX_BYTES, 50 * 1024 * 1024 * 1024, 'GATEHOUSE_DOWNLOAD_MAX_BYTES',
       1024 * 1024, Number.MAX_SAFE_INTEGER,
     ),
+    // 15s. Long enough for a page that reveals its link behind a short animation or a
+    // round-trip to the site's own backend; short enough that a selector a redesign broke
+    // costs one of these per step rather than a minute.
+    recipeStepMs: intFrom(env.GATEHOUSE_RECIPE_STEP_MS, 15_000, 'GATEHOUSE_RECIPE_STEP_MS', 1_000, 120_000),
+    // 60s across every step. Deliberately NOT constrained against the step budget: the engine
+    // hands a step the smaller of the two remaining budgets, so a total below a step's is
+    // simply a tighter recipe, which is how a test reaches this bound without waiting.
+    recipeTotalMs: intFrom(env.GATEHOUSE_RECIPE_TOTAL_MS, 60_000, 'GATEHOUSE_RECIPE_TOTAL_MS', 5_000, 600_000),
   };
 }

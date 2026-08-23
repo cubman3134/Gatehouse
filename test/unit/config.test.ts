@@ -165,6 +165,46 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '600001' })).toThrow(ConfigError);
   });
 
+  it('defaults the recipe budgets', () => {
+    const c = loadConfig({});
+    expect(c.recipeStepMs).toBe(15_000);
+    expect(c.recipeTotalMs).toBe(60_000);
+  });
+
+  it('accepts explicit recipe budgets', () => {
+    const c = loadConfig({ GATEHOUSE_RECIPE_STEP_MS: '3000', GATEHOUSE_RECIPE_TOTAL_MS: '9000' });
+    expect(c.recipeStepMs).toBe(3_000);
+    expect(c.recipeTotalMs).toBe(9_000);
+  });
+
+  it('accepts the recipe budgets at their exact boundaries', () => {
+    expect(loadConfig({ GATEHOUSE_RECIPE_STEP_MS: '1000' }).recipeStepMs).toBe(1_000);
+    expect(loadConfig({ GATEHOUSE_RECIPE_STEP_MS: '120000' }).recipeStepMs).toBe(120_000);
+    expect(loadConfig({ GATEHOUSE_RECIPE_TOTAL_MS: '5000' }).recipeTotalMs).toBe(5_000);
+    expect(loadConfig({ GATEHOUSE_RECIPE_TOTAL_MS: '600000' }).recipeTotalMs).toBe(600_000);
+  });
+
+  it('rejects recipe budgets just past their boundaries', () => {
+    expect(() => loadConfig({ GATEHOUSE_RECIPE_STEP_MS: '999' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_RECIPE_STEP_MS: '120001' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_RECIPE_TOTAL_MS: '4999' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_RECIPE_TOTAL_MS: '600001' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_RECIPE_STEP_MS: 'soon' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_RECIPE_STEP_MS: '1500.5' })).toThrow(ConfigError);
+  });
+
+  /**
+   * The two are NOT constrained against each other, and that is deliberate rather than an
+   * oversight: the engine hands a step the smaller of the two remaining budgets, so a total
+   * below a step's is simply a tighter recipe — and it is how a test reaches the total bound
+   * without sitting through a step.
+   */
+  it('allows a total below a single step budget', () => {
+    const c = loadConfig({ GATEHOUSE_RECIPE_STEP_MS: '120000', GATEHOUSE_RECIPE_TOTAL_MS: '5000' });
+    expect(c.recipeStepMs).toBe(120_000);
+    expect(c.recipeTotalMs).toBe(5_000);
+  });
+
   it('treats a whitespace-only downloads dir as unset', () => {
     expect(loadConfig({ GATEHOUSE_DOWNLOADS_DIR: '   ' }).downloadsDir).toBe('');
   });

@@ -15,6 +15,8 @@ export interface DownloadInit {
   url: string;
   session: string;
   referer: string | null;
+  /** See `DownloadRecord.viaRecipe`: the URL is a recipe's `startUrl`, not the file. */
+  viaRecipe?: boolean;
 }
 
 const MANIFEST = 'manifest.json';
@@ -123,6 +125,8 @@ export class DownloadStore {
       createdAt: t,
       completedAt: null,
       lastAccessAt: t,
+      // Only when true: an absent field keeps the manifest of an ordinary download unchanged.
+      ...(init.viaRecipe ? { viaRecipe: true } : {}),
     };
     this.records.set(rec.id, rec);
     await this.save();

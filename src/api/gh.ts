@@ -4,12 +4,20 @@ import type { DownloadStore } from '../downloads/store.js';
 import { isSettled } from '../downloads/record.js';
 import { serveFile } from './range.js';
 import { validateTarget, isTargetError } from './target.js';
+import { validateRecipe, isRecipeError, type Recipe } from '../downloads/recipe.js';
 import { log } from '../log.js';
 
 export interface GhDeps {
   store: DownloadStore;
-  /** Hand the id to the download queue. */
-  submit: (id: string) => void;
+  /**
+   * Hand the id to the download queue.
+   *
+   * The recipe travels **in memory, beside the record** rather than on it. It is a caller's
+   * selector contract — the site's markup, not ours — and it has no business in a manifest that
+   * is rewritten on every progress tick and read back by an operator. The consequence is
+   * deliberate and documented: a recipe download interrupted by a restart is not re-derived.
+   */
+  submit: (id: string, recipe?: Recipe) => void;
   /** Abort an in-flight download. */
   cancel: (id: string) => void;
   now: () => number;
@@ -146,8 +154,43 @@ async function postFetch(req: IncomingMessage, res: ServerResponse, deps: GhDeps
     return;
   }
 
+  /**
+   * `url` and `recipe` are alternatives, and **exactly one** of them is required.
+   *
+   * Not "recipe wins if present", and not "url wins": a body carrying both is a caller that
+   * believes one of the two is doing something, and half of that belief is wrong. Silently
+   * picking one would download the right bytes for the wrong reason on a good day and the
+   * whole page on a bad one. `undefined` is the only absence — an explicit `null` is a present
+   * value and falls through to the validator that can name what is wrong with it.
+   */
+  const hasUrl = body.url !== undefined;
+  const hasRecipe = body.recipe !== undefined;
+  if (hasUrl === hasRecipe) {
+    sendError(res, 400, 'bad-request', 'provide exactly one of url or recipe');
+    return;
+  }
+
+  let recipe: Recipe | null = null;
+  if (hasRecipe) {
+    // The browser navigates to `startUrl` itself, so it sends whatever `Referer` that
+    // navigation implies. A caller-supplied one would be either ignored or contradicted, and
+    // both are worse than saying so.
+    if (body.referer !== undefined && body.referer !== null && body.referer !== '') {
+      sendError(
+        res, 400, 'bad-request',
+        'referer is not accepted with a recipe; the browser sets its own from startUrl',
+      );
+      return;
+    }
+    const validated = validateRecipe(body.recipe);
+    if (isRecipeError(validated)) { sendError(res, 400, 'bad-request', validated.message); return; }
+    recipe = validated;
+  }
+
   // The same gate `/v1` applies, from the same module: two copies of a security check drift.
-  const target = validateTarget(body.url, body.site);
+  // A recipe's `startUrl` has already been through it inside `validateRecipe`; it goes through
+  // again here because that call could not see `site`, and the partition name is decided here.
+  const target = validateTarget(recipe ? recipe.startUrl : body.url, body.site);
   if (isTargetError(target)) { sendError(res, 400, 'bad-request', target.message); return; }
 
   const open = deps.store.findOpen(target.session, target.url);
@@ -184,8 +227,17 @@ async function postFetch(req: IncomingMessage, res: ServerResponse, deps: GhDeps
   // Mid-transfer resilience now comes from Chromium's own retry of a dropped ranged transfer.
   // Across a restart it comes from `requeueInterrupted`, which is a different mechanism and
   // still proven.
-  const rec = await deps.store.create({ url: target.url, session: target.session, referer });
-  deps.submit(rec.id);
+  //
+  // A recipe's record carries its `startUrl` as the record `url`, which is what keeps dedupe,
+  // the logs and `/gh/jobs/:id` working unchanged — and `viaRecipe`, which is the only thing
+  // about the recipe that is persisted, so a restart cannot mistake that page for the file.
+  const rec = await deps.store.create({
+    url: target.url,
+    session: target.session,
+    referer,
+    ...(recipe ? { viaRecipe: true } : {}),
+  });
+  deps.submit(rec.id, recipe ?? undefined);
   sendJson(res, 202, { jobId: rec.id, state: rec.state });
 }
 
