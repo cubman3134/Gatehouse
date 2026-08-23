@@ -5,24 +5,18 @@ import type { BrowserWindow, DownloadItem, Event, Session, WebContents } from 'e
 import type { DownloadStore } from './store.js';
 import type { DownloadRecord, FailureCode } from './record.js';
 import { planResume } from './resumable.js';
+import { STALLED } from './stalled.js';
 import { log } from '../log.js';
 
 /**
- * The abort reason that means "this transfer stopped moving", as against "the caller asked for
- * it to stop". The watchdog aborts with THIS value; the settle path below reads it back off
- * `signal.reason` and settles accordingly.
+ * The stall abort reason, re-exported so this module reads as self-contained.
  *
- * A symbol, exported, rather than a sentinel string: only code that imports this binding can
- * produce a value that compares equal to it, so a caller's own `abort('stalled')` is still an
- * ordinary cancel, and neither side can drift by rewording a literal.
- *
- * **It is a DIFFERENT symbol from `transfer.ts`'s, and identity is the whole mechanism.** While
- * both modules exist, whichever one the watchdog imports is the one it agrees with. The wiring
- * that points `main.ts` at `browserDownload` must move its `STALLED` import here in the same
- * change; a mismatch is silent — every stall would settle as a caller cancel, which is a lie
- * about who acted and (see below) bins the partial.
+ * It is deliberately not minted here: it is minted once, in `stalled.ts`, and `transfer.ts`
+ * re-exports that same binding. Identity is the whole mechanism and a second mint would compare
+ * unequal while printing identically, so whichever engine the watchdog in `main.ts` is wired
+ * to, both sides are looking at one symbol. See `stalled.ts` for why that failure is silent.
  */
-export const STALLED: unique symbol = Symbol('gatehouse:download-stalled');
+export { STALLED } from './stalled.js';
 
 /**
  * How many bytes may arrive before progress is persisted again.
@@ -185,9 +179,10 @@ export async function browserDownload(
 
     /** A cancel is the caller's own doing and its bytes are unwanted, so the partial goes. */
     const settleCancelled = async (): Promise<void> => {
-      // Chromium already deletes the partial of an item it cancelled — including a paused one —
-      // so this is usually a no-op; it is here for the cancel that lands before any item exists.
-      await dropPartial();
+      // The flag is claimed FIRST, before the unlink. `dropPartial` awaits an `rm` that can take
+      // real time on Windows, and a `noStart` expiry landing inside that window would otherwise
+      // win the settle and record a caller's cancel as `failed`/`network` — wrong about who
+      // acted, and reclaimable to boot.
       log.info('download cancelled', { id });
       await finish({
         state: 'cancelled',
@@ -195,6 +190,11 @@ export async function browserDownload(
         completedAt: deps.store.nowMs(),
         error: { code: 'cancelled', message: 'cancelled by the caller' },
       });
+      // Chromium already deletes the partial of an item it cancelled — including a paused one —
+      // so this is usually a no-op; it is here for the cancel that lands before any item exists.
+      // Unconditional, even when another path won the settle: a cancel's bytes are unwanted
+      // whoever got there first.
+      await dropPartial();
     };
 
     /**
@@ -312,6 +312,14 @@ export async function browserDownload(
                 log.warn('download did not complete', { id, state, received });
                 await finish(failedPatch('network', `the download ${state}`, received));
               }
+            } catch (e: unknown) {
+              // Nothing here may escape. This IIFE is detached, so a throw would surface as an
+              // unhandled rejection — out of band from the promise the outer try/catch guards —
+              // and take the daemon down. A settle has already been attempted; the most this can
+              // do now is say so.
+              log.error('download settle threw', {
+                id, reason: e instanceof Error ? e.message : String(e),
+              });
             } finally {
               resolve();
             }
@@ -444,8 +452,9 @@ export async function browserDownload(
 
         // A host that accepts the socket and then says nothing never fires `will-download` at
         // all — measured at 150s with no timeout, no error and nothing to cancel. This timer is
-        // the only thing that ends that, and the idle watchdog cannot help: it needs a record
-        // whose `received` moved at least once.
+        // the only thing that ends that. The idle watchdog would eventually fire too — it seeds
+        // its clock unconditionally, so it does not need `received` to have moved — but this
+        // timer is a tighter bound and, unlike a stall, it names the fault: nothing ever began.
         noStart = setTimeout(() => {
           if (item) return; // it started; the idle watchdog owns it from here
           log.warn('download never started', { id, noStartMs: deps.noStartMs });

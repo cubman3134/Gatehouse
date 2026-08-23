@@ -5,6 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { DownloadStore } from './store.js';
 import type { DownloadRecord, FailureCode } from './record.js';
+import { STALLED } from './stalled.js';
 import { log } from '../log.js';
 
 export interface TransferResponse {
@@ -46,7 +47,7 @@ export const PROGRESS_BYTES = 4 * 1024 * 1024;
  * settle site: the watchdog still only aborts, and `transfer` remains the only writer of a
  * terminal state, per the invariant in `record.ts`.
  */
-export const STALLED = Symbol('gatehouse:download-stalled');
+export { STALLED } from './stalled.js';
 
 /**
  * What a stall-abandoned record says. The log line names the id and the window; this is what a
