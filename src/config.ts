@@ -17,6 +17,14 @@ export interface GatehouseConfig {
    * to take hours.
    */
   downloadStallMs: number;
+  /**
+   * How long to wait for a download to begin at all before giving up.
+   *
+   * A different fault from a stall, and a tighter bound: a host that accepts the socket and
+   * then writes nothing never fires `will-download`, so there is no item, no bytes and
+   * nothing for the idle watchdog to name. This one names it — nothing ever began.
+   */
+  downloadNoStartMs: number;
   /** How long a completed download's bytes survive without being released. */
   downloadTtlMs: number;
   /** Cap on the downloads directory; least-recently-accessed completed files evict first. */
@@ -76,13 +84,17 @@ export function loadConfig(env: Record<string, string | undefined>): GatehouseCo
     solveTimeoutMs: intFrom(env.GATEHOUSE_SOLVE_TIMEOUT_MS, 70_000, 'GATEHOUSE_SOLVE_TIMEOUT_MS', 1_000, 600_000),
     downloadsDir,
     downloadConcurrency: intFrom(env.GATEHOUSE_DOWNLOAD_CONCURRENCY, 2, 'GATEHOUSE_DOWNLOAD_CONCURRENCY', 1, 16),
-    // 120s, and the floor of 5000 is deliberate. `transfer` only persists `received` every
-    // PROGRESS_BYTES (4MB), so this window has to be comfortably longer than the time to move
-    // 4MB on the slowest link worth serving: at 256 kbit/s that is ~130s of wall clock with
-    // ZERO observable progress, and 120s already sits near that line. Do not tighten this
+    // 120s, and the floor of 5000 is deliberate. The download engine only persists `received`
+    // every PROGRESS_BYTES (4MB), so this window has to be comfortably longer than the time to
+    // move 4MB on the slowest link worth serving: at 256 kbit/s that is ~130s of wall clock
+    // with ZERO observable progress, and 120s already sits near that line. Do not tighten this
     // without moving the progress throttle down with it, or a slow-but-healthy download is
     // killed for looking idle.
     downloadStallMs: intFrom(env.GATEHOUSE_DOWNLOAD_STALL_MS, 120_000, 'GATEHOUSE_DOWNLOAD_STALL_MS', 5_000, 3_600_000),
+    // 60s. This one measures the request phase only — nothing has been received yet, so it is
+    // not competing with the progress throttle the stall window has to clear, and it can be
+    // much tighter. The floor of 5000 keeps it from firing on an ordinary slow TLS handshake.
+    downloadNoStartMs: intFrom(env.GATEHOUSE_DOWNLOAD_NO_START_MS, 60_000, 'GATEHOUSE_DOWNLOAD_NO_START_MS', 5_000, 600_000),
     downloadTtlMs: intFrom(env.GATEHOUSE_DOWNLOAD_TTL_MS, 86_400_000, 'GATEHOUSE_DOWNLOAD_TTL_MS', 60_000, 2_592_000_000),
     downloadMaxBytes: intFrom(
       env.GATEHOUSE_DOWNLOAD_MAX_BYTES, 50 * 1024 * 1024 * 1024, 'GATEHOUSE_DOWNLOAD_MAX_BYTES',

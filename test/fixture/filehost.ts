@@ -33,6 +33,19 @@ export interface FileHostOptions {
   mode?: 'range' | 'no-range' | 'truncate' | 'stall' | 'chunked' | 'no-headers' | 'lying-206' | 'shifted-206' | 'headerless-206';
   body?: Buffer;
   filename?: string;
+  /**
+   * `chunked` only: how many pieces the body is written in, and how long to pause between
+   * them. The defaults (2, 0ms) are the original behaviour — a body that arrives in more than
+   * one chunk, as fast as the socket takes it.
+   *
+   * Pacing exists so a test can observe a download *while it is running* rather than only
+   * after it settled. `progress.total` is `-1` from the moment the record is created, so the
+   * only way to prove the engine did not overwrite it with a false `0` on reading the headers
+   * is to look during the transfer — and on loopback an unpaced few megabytes are gone before
+   * the first poll lands.
+   */
+  chunks?: number;
+  chunkDelayMs?: number;
 }
 
 /** How long 'truncate' mode lets the body flow before it kills the socket. See the use site. */
@@ -62,12 +75,26 @@ export async function startFileHost(opts: FileHostOptions = {}): Promise<FileHos
     }
 
     if (mode === 'chunked') {
-      // Omitting content-length is what makes Node frame this as chunked; two writes so the
-      // body genuinely arrives in more than one chunk.
+      // Omitting content-length is what makes Node frame this as chunked; several writes so
+      // the body genuinely arrives in more than one chunk.
       res.writeHead(200, common);
-      const half = Math.ceil(body.length / 2);
-      res.write(body.subarray(0, half));
-      res.end(body.subarray(half));
+      const pieces = Math.max(1, opts.chunks ?? 2);
+      const delay = Math.max(0, opts.chunkDelayMs ?? 0);
+      const per = Math.ceil(body.length / pieces);
+      let sent = 0;
+      const writeNext = (): void => {
+        // The pause outlives nothing: `close()` destroys the socket under a paced response, so
+        // a timer that fires afterwards must not write to a dead one.
+        if (res.writableEnded || res.destroyed) return;
+        const slice = body.subarray(sent, Math.min(sent + per, body.length));
+        sent += slice.length;
+        if (sent >= body.length) { res.end(slice); return; }
+        res.write(slice);
+        if (delay === 0) { writeNext(); return; }
+        // `unref` so a half-written response can never be the reason the test runner stays up.
+        setTimeout(writeNext, delay).unref?.();
+      };
+      writeNext();
       return;
     }
 

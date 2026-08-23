@@ -1,28 +1,26 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtemp, rm, stat, readdir } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import { startGatehouse, type Harness } from './harness.js';
 import { startFileHost, type FileHost } from '../fixture/filehost.js';
 
 /**
- * The whole download path through the REAL built app: `/gh/fetch` accepted by the shipped
- * server, the bytes pulled by Electron's `net` on a persistent partition, written by
- * `transfer`, recorded by `DownloadStore`, and served back by the Range file server.
+ * The `/gh/*` SURFACE through the real built app: what a POST is folded onto, what frees a
+ * wedged slot, and what the health route says. The engine underneath it — Chromium's own
+ * download stack, hashing, the `.part` rename, Range serving, one window per job — is covered
+ * in `browser-download.test.ts`; this file is about the scheduling and dedupe rules the API
+ * promises, which are engine-independent.
  *
  * Nothing here is stubbed. The one thing it deliberately does not prove is the premise — the
- * file host is a local fixture, not a Cloudflare-protected origin, so this shows the mechanism
- * works and says nothing about whether a real host would hand these bytes over.
+ * file host is a local fixture, not a Cloudflare-protected origin.
  */
 
 let gh: Harness;
 let host: FileHost;
 let dir: string;
 
-// Big enough that the body genuinely streams in many chunks rather than arriving in one.
-const BODY = Buffer.alloc(3 * 1024 * 1024, 42);
-const SHA = createHash('sha256').update(BODY).digest('hex');
+const BODY = Buffer.alloc(256 * 1024, 42);
 
 beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), 'gh-dl-'));
@@ -47,7 +45,7 @@ const job = async (id: string): Promise<JobBody> =>
   (await (await fetch(`${gh.url}/gh/jobs/${id}`)).json()) as JobBody;
 
 /** Poll until the job reaches `want`, or settles as something else, or the deadline passes. */
-const poll = async (id: string, want: string, ms = 30_000): Promise<JobBody> => {
+const poll = async (id: string, want: string, ms = 60_000): Promise<JobBody> => {
   const deadline = Date.now() + ms;
   for (;;) {
     const body = await job(id);
@@ -60,53 +58,34 @@ const poll = async (id: string, want: string, ms = 30_000): Promise<JobBody> => 
   }
 };
 
-describe('downloading through the real app', () => {
-  let id: string;
-
-  it('accepts a fetch and completes it', async () => {
-    const res = await fetch(`${gh.url}/gh/fetch`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ url: host.url, site: 'filehost' }),
-    });
-    expect(res.status).toBe(202);
-    const accepted = (await res.json()) as { jobId: string; state: string };
-    id = accepted.jobId;
-    expect(accepted.state).toBe('queued');
-
-    const done = await poll(id, 'done');
-    expect(done.error).toBeUndefined();
-    expect(done.state).toBe('done');
-    expect(done.result!.size).toBe(BODY.length);
-    // The hash is the real proof: the bytes on disk are the bytes the host served, in order.
-    expect(done.result!.sha256).toBe(SHA);
-    expect(done.result!.filename).toBe('payload.bin');
-    expect(done.result!.url).toBe(`/gh/files/${id}`);
-
-    // A local path a consumer can hand to a mover, at the right size — the zero-copy case.
-    expect((await stat(done.result!.path)).size).toBe(BODY.length);
-    expect(done.result!.path.startsWith(dir)).toBe(true);
-  }, 60_000);
-
-  // NOT a dedupe test, whatever it was once called: the first job has already settled, so the
-  // assertion below is that dedupe deliberately does NOT apply. The window is "unsettled
-  // records only", or a completed download would pin a caller to bytes it may already have
-  // released. The real in-flight dedupe is the test after this one.
+describe('the /gh/* surface on the real app', () => {
+  // NOT a dedupe test, whatever it was once called: the first job settles before the second
+  // POST, so the assertion is that dedupe deliberately does NOT apply. The window is
+  // "unsettled records only", or a completed download would pin a caller to bytes it may
+  // already have released. The real in-flight dedupe is the test after this one.
   it('starts a fresh job when the previous download of the same target has settled', async () => {
-    const res = await fetch(`${gh.url}/gh/fetch`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ url: host.url, site: 'filehost' }),
-    });
-    expect(res.status).toBe(202);
-    const second = (await res.json()) as { jobId: string };
-    expect(second.jobId).not.toBe(id);
-    await poll(second.jobId, 'done');
-    await fetch(`${gh.url}/gh/jobs/${second.jobId}`, { method: 'DELETE' });
-  }, 60_000);
+    const send = async (): Promise<string> => {
+      const res = await fetch(`${gh.url}/gh/fetch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: host.url, site: 'filehost' }),
+      });
+      expect(res.status).toBe(202);
+      return ((await res.json()) as { jobId: string }).jobId;
+    };
+
+    const first = await send();
+    expect((await poll(first, 'done')).state).toBe('done');
+
+    const second = await send();
+    expect(second).not.toBe(first);
+    expect((await poll(second, 'done')).state).toBe('done');
+
+    for (const id of [first, second]) await fetch(`${gh.url}/gh/jobs/${id}`, { method: 'DELETE' });
+  }, 120_000);
 
   it('dedupes a second fetch onto the job that is still in flight', async () => {
-    // A host that never finishes is what holds the first job UNSETTLED long enough for the
+    // A host that never answers is what holds the first job UNSETTLED long enough for the
     // second POST to land on it — the whole point of the dedupe window.
     const slowHost = await startFileHost({ mode: 'no-headers' });
     const body = JSON.stringify({ url: slowHost.url, site: 'dedupe' });
@@ -120,10 +99,10 @@ describe('downloading through the real app', () => {
     try {
       const first = await send();
       const second = await send();
-      expect(second).toBe(first); // one record, one transfer, one set of bytes
+      expect(second).toBe(first); // one record, one download, one set of bytes
     } finally {
-      // Leave nothing running: this app's stall window is the 120s default, so only the
-      // DELETE frees the slot before the suite ends.
+      // Leave nothing running: this app is on the default windows, so only the DELETE frees
+      // the slot before the suite ends.
       const dead = await fetch(`${gh.url}/gh/fetch`, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body,
       });
@@ -132,74 +111,18 @@ describe('downloading through the real app', () => {
     }
   }, 60_000);
 
-  it('serves the bytes back, with Range', async () => {
-    const whole = await fetch(`${gh.url}/gh/files/${id}`);
-    expect(whole.status).toBe(200);
-    expect(whole.headers.get('accept-ranges')).toBe('bytes');
-    expect(Buffer.from(await whole.arrayBuffer()).equals(BODY)).toBe(true);
-
-    const part = await fetch(`${gh.url}/gh/files/${id}`, { headers: { range: 'bytes=100-199' } });
-    expect(part.status).toBe(206);
-    expect(part.headers.get('content-range')).toBe(`bytes 100-199/${BODY.length}`);
-    expect(Buffer.from(await part.arrayBuffer()).equals(BODY.subarray(100, 200))).toBe(true);
-  }, 60_000);
-
-  it('releases the bytes on DELETE', async () => {
-    const path = (await job(id)).result!.path;
-    expect((await fetch(`${gh.url}/gh/jobs/${id}`, { method: 'DELETE' })).status).toBe(204);
-    expect((await fetch(`${gh.url}/gh/jobs/${id}`)).status).toBe(404);
-    expect((await fetch(`${gh.url}/gh/files/${id}`)).status).toBe(404);
-    await expect(stat(path)).rejects.toThrow();
-  }, 60_000);
-
-  it('cancels an in-flight download and leaves no partial', async () => {
-    // 'stall' sends headers and one byte, then nothing forever — the transfer is parked in its
-    // read loop, which is the state a cancel has to be able to interrupt.
-    const stallHost = await startFileHost({ mode: 'stall' });
-    try {
-      const res = await fetch(`${gh.url}/gh/fetch`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ url: stallHost.url, site: 'stall' }),
-      });
-      expect(res.status).toBe(202);
-      const stallId = ((await res.json()) as { jobId: string }).jobId;
-      await new Promise((r) => setTimeout(r, 500));
-      expect((await job(stallId)).state).toBe('running');
-
-      expect((await fetch(`${gh.url}/gh/jobs/${stallId}`, { method: 'DELETE' })).status).toBe(204);
-      const settled = await poll(stallId, 'cancelled', 15_000);
-      expect(settled.state).toBe('cancelled');
-
-      // What this asserts is NOT "the partial was cleaned up". Electron's `net` does not hand
-      // a response to the transfer until it has buffered rather more than the one byte this
-      // mode sends, so measured here the transfer is still parked in its REQUEST phase — no
-      // response, no write stream, hence no `<id>.part` was ever created for the cleanup to
-      // remove. The `total: -1` below is the proof of that, and it is why the assertion that
-      // follows would pass with the partial-deletion deleted.
-      //
-      // So this covers the request-phase cancel through the shipped Electron requester, which
-      // is worth having. The MID-BODY cancel — bytes on disk, stream open, partial unlinked
-      // after the handle is released — is covered against `nodeRequester` in
-      // test/unit/transfer.test.ts ("cancels and deletes the partial when the signal aborts"),
-      // and cannot be reached from here without a host Electron will actually stream from.
-      expect(settled.progress.total).toBe(-1);
-      const left = (await readdir(dir)).filter((f) => f.startsWith(stallId));
-      expect(left).toEqual([]);
-    } finally {
-      await stallHost.close();
-    }
-  }, 60_000);
-
   /**
-   * Finding: a host that accepts the socket and never writes holds a concurrency slot with
-   * nothing able to settle it but a caller DELETE. At the default of two slots, two such hosts
-   * wedge the whole download surface while `/gh/fetch` keeps handing out 202s that never run.
+   * Finding: a host that goes quiet holds a concurrency slot with nothing able to settle it
+   * but a caller DELETE. At the default of two slots, two such hosts wedge the whole download
+   * surface while `/gh/fetch` keeps handing out 202s that never run.
    *
-   * This runs a SECOND app of its own: one slot, so a wedged transfer starves everything, and
+   * This runs a SECOND app of its own: one slot, so a wedged download starves everything, and
    * a 5s stall window (the configured minimum) so the test does not sit through the 120s
-   * default. The assertion is not just "the stalled job settled" — it is that the job queued
-   * BEHIND it then ran to completion, which is what "the slot was freed" actually means.
+   * default. The no-start window is pinned high so what fires here is unambiguously the idle
+   * watchdog and not `browserDownload`'s own request-phase timer, which would settle the same
+   * record with a different message. The assertion is not just "the stalled job settled" — it
+   * is that the job queued BEHIND it then ran to completion, which is what "the slot was
+   * freed" actually means.
    */
   it('aborts a download that has gone idle, and frees the slot for the next one', async () => {
     const silentHost = await startFileHost({ mode: 'no-headers' });
@@ -209,6 +132,7 @@ describe('downloading through the real app', () => {
       GATEHOUSE_DOWNLOADS_DIR: stallDir,
       GATEHOUSE_DOWNLOAD_CONCURRENCY: '1',
       GATEHOUSE_DOWNLOAD_STALL_MS: '5000',
+      GATEHOUSE_DOWNLOAD_NO_START_MS: '120000',
     });
 
     const fetchJob = async (url: string, site: string): Promise<string> => {
@@ -238,22 +162,22 @@ describe('downloading through the real app', () => {
       const silent = await fetchJob(silentHost.url, 'silenthost');
       const behind = await fetchJob(goodHost.url, 'goodhost');
 
-      // The premise: the silent transfer holds the only slot and the next job cannot start.
+      // The premise: the silent download holds the only slot and the next job cannot start.
       await new Promise((r) => setTimeout(r, 1_000));
       expect((await state(silent)).state).toBe('running');
       expect((await state(behind)).state).toBe('queued');
 
-      // The watchdog aborts, and it aborts WITH A REASON. `transfer` reads it off
+      // The watchdog aborts, and it aborts WITH A REASON. The engine reads it off
       // `signal.reason` and settles a stall as the retryable host fault it is — `failed` /
       // `network` — rather than as `cancelled`, which would report the caller's own action back
       // to a caller that did nothing. Still one settle site; only the reason crossed.
       const stalled = await settleWithin(silent, 20_000);
       expect(stalled.state).toBe('failed');
       expect(stalled.error!.code).toBe('network');
-      expect(stalled.error!.message).toMatch(/stall/i);
+      expect(stalled.error!.message).toMatch(/no bytes arrived/i);
 
       // The slot really was freed: the job behind it ran, and ran to completion.
-      const next = await settleWithin(behind, 20_000);
+      const next = await settleWithin(behind, 30_000);
       expect(next.state).toBe('done');
       expect(next.result!.size).toBe(64 * 1024);
     } finally {

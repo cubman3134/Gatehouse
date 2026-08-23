@@ -1,13 +1,13 @@
 /**
- * The abort reason that means "this transfer stopped moving", as against "the caller asked for
- * it to stop". The idle watchdog aborts with THIS value; a download engine reads it back off
+ * The abort reason that means "this download stopped moving", as against "the caller asked for
+ * it to stop". The idle watchdog aborts with THIS value; the download engine reads it back off
  * `signal.reason` and settles accordingly.
  *
  * The two outcomes are genuinely different and must not share a terminal state. A caller's
- * cancel is the caller's own doing and its bytes are unwanted, so the record reads `cancelled`.
- * A stall is a retryable HOST fault the caller never asked for, and reporting it as `cancelled`
- * is a lie about who acted — one that `findResumable` then acts on, because it refuses a
- * `cancelled` record outright.
+ * cancel is the caller's own doing, so the record reads `cancelled` and a `/gh/jobs/:id` poller
+ * sees its own action reported back. A stall is a retryable HOST fault the caller never asked
+ * for, so it settles `failed`/`network` — the state that says "try again", about a fault nobody
+ * here caused. Reporting it as `cancelled` would be a lie about who acted.
  *
  * A symbol, exported, rather than a sentinel string: only code that imports this binding can
  * produce a value that compares equal to it, so a caller's own `abort('stalled')` is still an

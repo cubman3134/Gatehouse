@@ -76,6 +76,7 @@ describe('loadConfig', () => {
     const c = loadConfig({});
     expect(c.downloadConcurrency).toBe(2);
     expect(c.downloadStallMs).toBe(120_000);
+    expect(c.downloadNoStartMs).toBe(60_000);
     expect(c.downloadTtlMs).toBe(86_400_000);
     expect(c.downloadMaxBytes).toBe(50 * 1024 * 1024 * 1024);
     expect(c.downloadsDir).toBe('');
@@ -88,12 +89,14 @@ describe('loadConfig', () => {
       GATEHOUSE_DOWNLOAD_TTL_MS: '3600000',
       GATEHOUSE_DOWNLOAD_MAX_BYTES: '1073741824',
       GATEHOUSE_DOWNLOAD_STALL_MS: '30000',
+      GATEHOUSE_DOWNLOAD_NO_START_MS: '15000',
     });
     expect(c.downloadsDir).toBe(ABS);
     expect(c.downloadConcurrency).toBe(5);
     expect(c.downloadTtlMs).toBe(3_600_000);
     expect(c.downloadMaxBytes).toBe(1_073_741_824);
     expect(c.downloadStallMs).toBe(30_000);
+    expect(c.downloadNoStartMs).toBe(15_000);
   });
 
   // A relative value would be resolved against whatever directory `electron .` was launched
@@ -132,6 +135,17 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_STALL_MS: 'soon' })).toThrow(ConfigError);
   });
 
+  // A different fault from a stall and a much tighter bound: nothing has been received yet, so
+  // this window is not competing with the 4MB progress throttle the stall window has to clear.
+  it('defaults the no-start window to 60s and holds it to [5000, 600000]', () => {
+    expect(loadConfig({}).downloadNoStartMs).toBe(60_000);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '4999' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '600001' })).toThrow(ConfigError);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '5000' }).downloadNoStartMs).toBe(5_000);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '600000' }).downloadNoStartMs).toBe(600_000);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: 'never' })).toThrow(ConfigError);
+  });
+
   // Rejection alone does not catch an off-by-one in the comparison; the boundary values
   // have to be asserted ACCEPTED too.
   it('accepts the download settings at their exact boundaries', () => {
@@ -140,11 +154,15 @@ describe('loadConfig', () => {
     expect(loadConfig({ GATEHOUSE_DOWNLOAD_TTL_MS: '60000' }).downloadTtlMs).toBe(60_000);
     expect(loadConfig({ GATEHOUSE_DOWNLOAD_TTL_MS: '2592000000' }).downloadTtlMs).toBe(2_592_000_000);
     expect(loadConfig({ GATEHOUSE_DOWNLOAD_MAX_BYTES: '1048576' }).downloadMaxBytes).toBe(1_048_576);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '5000' }).downloadNoStartMs).toBe(5_000);
+    expect(loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '600000' }).downloadNoStartMs).toBe(600_000);
   });
 
   it('rejects download settings just past their boundaries', () => {
     expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_TTL_MS: '2592000001' })).toThrow(ConfigError);
     expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_MAX_BYTES: '1048575' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '4999' })).toThrow(ConfigError);
+    expect(() => loadConfig({ GATEHOUSE_DOWNLOAD_NO_START_MS: '600001' })).toThrow(ConfigError);
   });
 
   it('treats a whitespace-only downloads dir as unset', () => {

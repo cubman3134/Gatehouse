@@ -51,11 +51,13 @@ describe('POST /gh/fetch', () => {
     expect(submitted).toEqual(['d1']); // scheduled once, not twice
   });
 
-  // `transfer` keeps a partial on every failure so a later attempt can resume from it. Outside
-  // a restart, THIS is the attempt: a re-POST takes the failed record over under its own id
-  // rather than minting a new one, or a 40GB download restarts from zero after a blip and the
-  // kept bytes are orphaned until the sweep.
-  it('resumes a transiently-failed download under its existing job id', async () => {
+  // There is deliberately NO reclaim of a settled `failed` record. It existed for the
+  // byte-stream transfer, where a failure kept its partial; under the browser engine every
+  // reachable failure settles with no partial (a stall ends in `item.cancel()` and Chromium
+  // deletes the file), and the one shape that did still match — a complete `.part` that could
+  // not be hashed or renamed — resumed at `offset === size`, took a 416, and looped. So a
+  // re-POST after a failure is an ordinary new download with a new id, even with bytes on disk.
+  it('mints a fresh id for a settled failure rather than reclaiming it', async () => {
     await post({ url: 'http://example.test/f.bin' });
     await writeFile(store.partPath('d1'), 'the bytes we already have');
     await store.update('d1', { state: 'failed', received: 25, error: { code: 'network', message: 'connection reset' }, completedAt: clock });
@@ -64,36 +66,12 @@ describe('POST /gh/fetch', () => {
     const res = await post({ url: 'http://example.test/f.bin' });
     expect(res.status).toBe(202);
     const body = await res.json() as any;
-    expect(body.jobId).toBe('d1'); // the same id, not a fresh d2
+    expect(body.jobId).toBe('d2');
     expect(body.state).toBe('queued');
-    expect(submitted).toEqual(['d1']);
-    // Unsettled again, and the stale failure cleared — or `/gh/jobs/d1` would report a queued
-    // job that also carries an error, and `findOpen` would not fold the next request onto it.
-    const rec = store.get('d1')!;
-    expect(rec.state).toBe('queued');
-    expect(rec.error).toBeUndefined();
-    expect(rec.completedAt).toBeNull();
-    expect(rec.received).toBe(25); // the progress it resumes from
-  });
-
-  it('does not resume a permanent failure or a cancel', async () => {
-    for (const [url, patch] of [
-      ['http://example.test/a.bin', { state: 'failed' as const, error: { code: 'http-error' as const, message: '404' } }],
-      ['http://example.test/b.bin', { state: 'failed' as const, error: { code: 'disk-full' as const, message: 'ENOSPC' } }],
-      ['http://example.test/c.bin', { state: 'cancelled' as const, error: { code: 'cancelled' as const, message: 'cancelled by the caller' } }],
-    ] as const) {
-      const first = ((await (await post({ url })).json()) as any).jobId as string;
-      await writeFile(store.partPath(first), 'leftovers');
-      await store.update(first, { ...patch, completedAt: clock });
-      const again = ((await (await post({ url })).json()) as any).jobId as string;
-      expect(again, url).not.toBe(first); // a fresh id, a fresh download
-    }
-  });
-
-  it('does not resume a failure whose partial is gone', async () => {
-    await post({ url: 'http://example.test/f.bin' });
-    await store.update('d1', { state: 'failed', error: { code: 'network', message: 'reset' }, completedAt: clock });
-    expect(((await (await post({ url: 'http://example.test/f.bin' })).json()) as any).jobId).toBe('d2');
+    expect(submitted).toEqual(['d2']);
+    // The old record is left exactly as it settled — not resurrected, not re-queued. The sweep
+    // owns its bytes from here.
+    expect(store.get('d1')!.state).toBe('failed');
   });
 
   it('rejects a file: url with our error shape', async () => {
