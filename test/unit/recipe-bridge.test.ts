@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
@@ -186,12 +186,17 @@ async function runRecipeDownload(
     /** Fire `preload-error` as the first step goes out, the way a broken preload would have. */
     breakPreloadOnFirstStep?: boolean;
     signal?: AbortSignal;
+    /** This window's webContents id — the value the main side filters replies on. */
+    wcId?: number;
+    /** Its own downloads directory, so two concurrent jobs do not share a manifest. */
+    dir?: string;
   } = {},
-): Promise<{ rec: ReturnType<DownloadStore['get']>; rig: Rig; elapsed: number }> {
-  store = new DownloadStore({ dir, now: () => Date.now(), idgen: () => id, ttlMs: 600_000, maxBytes: 1e9 });
-  await store.create({ url: RECIPE.startUrl, session: 'host.test', referer: null, viaRecipe: true });
+): Promise<{ rec: ReturnType<DownloadStore['get']>; rig: Rig; elapsed: number; store: DownloadStore }> {
+  const own = new DownloadStore({ dir: opts.dir ?? dir, now: () => Date.now(), idgen: () => id, ttlMs: 600_000, maxBytes: 1e9 });
+  store = own;
+  await own.create({ url: RECIPE.startUrl, session: 'host.test', referer: null, viaRecipe: true });
 
-  const wcId = 77;
+  const wcId = opts.wcId ?? 77;
   const rig: Rig = {
     asked: [],
     renderer: null as unknown as Renderer,
@@ -246,7 +251,7 @@ async function runRecipeDownload(
   } as unknown as BrowserWindow;
 
   const deps: BrowserDownloadDeps = {
-    store,
+    store: own,
     partitionFor: () => ses.session,
     makeWindow: () => { rig.windows += 1; return win; },
     noStartMs: 60_000,
@@ -262,7 +267,7 @@ async function runRecipeDownload(
 
   const started = Date.now();
   await browserDownload(id, deps, opts.signal ?? new AbortController().signal);
-  return { rec: store.get(id), rig, elapsed: Date.now() - started };
+  return { rec: own.get(id), rig, elapsed: Date.now() - started, store: own };
 }
 
 /** The page the measured flow describes: a button that reveals a link a moment later. */
@@ -417,6 +422,78 @@ describe('a page bridge that does not answer', () => {
     expect(rec!.error!.code).toBe('recipe-failed');
     expect(rec!.error!.message).toMatch(/bridge failed to load/);
     expect(elapsed).toBeLessThan(5_000);
+  }, 20_000);
+});
+
+describe('two recipe windows on one ipcMain', () => {
+  /** The URL only B's page can produce. If it ever comes out of A, a reply crossed windows. */
+  const B_URL = 'http://host.test/b-only.bin';
+
+  /**
+   * `ipcMain` is process-wide: every concurrent recipe window answers on the SAME result
+   * channel, and the only thing that tells our page's reply from a sibling's is the sender id
+   * the main side filters on. Every other test in this file runs ONE window against a fresh
+   * emitter, where deleting that filter changes nothing at all.
+   *
+   * So: two jobs, at once, on one emitter. A's page receives every step and answers none. B's
+   * answers normally and derives a URL only B's document contains. With the filter, A hears
+   * none of B's traffic and dies on its own step-0 deadline having fetched nothing. Without it,
+   * A takes B's replies for its own and downloads B's file — a job completing on another job's
+   * bytes, which reaches the caller as a plausible-looking download of the wrong thing and
+   * appears in no log as anything but success.
+   *
+   * **B is started second, deliberately.** A step listens for ONE sequence number and A's never
+   * advances past 1, so a reply it can mistake for its own has to arrive while it is parked on
+   * that step. Racing both jobs off the same line makes that a coin flip — measured, B's first
+   * reply beat A's first listener about half the time, and a filterless build passed. So A is
+   * given a head start, and `finished` below asserts the precondition rather than assuming it:
+   * B's whole exchange has to complete inside A's wait, or this proves nothing.
+   */
+  it("ignores a reply carrying the other window's sender id", async () => {
+    const aDir = join(dir, 'a');
+    const bDir = join(dir, 'b');
+    await mkdir(aDir);
+    await mkdir(bDir);
+
+    const finished: string[] = [];
+    const a = runRecipeDownload('crosstalk-a', {
+      dir: aDir,
+      wcId: 77,
+      mutePage: true, // A's page is handed every step and answers none of them
+      stepMs: 2_000, // long enough to hold A on step 0 for the whole of B's run
+      totalMs: 20_000,
+      seedDoc: (r) => { r.doc.els.push(el('button', { text: 'Download' })); },
+      // Only ever reached if A acted on a reply that was not its own. Without it that path
+      // would hang on the no-start window and read as a timeout instead of as the assertion
+      // below.
+      onDownload: (r) => { r.startItemFromPage().finish('interrupted'); },
+    }).then((r) => { finished.push('a'); return r; });
+
+    // A is parked on step 0 by now: everything before its first `send` is synchronous or a
+    // microtask, and the only timer in play is its own 2s step deadline.
+    await new Promise((r) => setTimeout(r, 150));
+
+    const b = runRecipeDownload('crosstalk-b', {
+      dir: bDir,
+      wcId: 88,
+      seedDoc: revealing(B_URL),
+      onDownload: (r) => { r.startItemFromPage().finish('interrupted'); },
+    }).then((r) => { finished.push('b'); return r; });
+
+    const [ra, rb] = await Promise.all([a, b]);
+
+    // The precondition: B ran its whole exchange, on the shared emitter, while A sat waiting
+    // for an answer. Without this the test could pass with no cross-talk to ignore at all.
+    expect(finished, 'B did not answer while A was still waiting on a step').toEqual(['b', 'a']);
+    expect(rb.rig.renderer.replies.map((r) => r.args[0])).toEqual([1, 2, 3]);
+    expect(rb.rig.asked).toEqual([B_URL]);
+
+    // And A heard none of it: no fetch, and the failure is still its OWN silent page.
+    expect(ra.rig.asked, "a job fetched a URL only the other window's page produced").toEqual([]);
+    expect(ra.rec!.state).toBe('failed');
+    expect(ra.rec!.error!.code).toBe('recipe-failed');
+    expect(ra.rec!.error!.message).toMatch(/step 0/);
+    expect(ra.rec!.error!.message).toMatch(/no answer from the page bridge/);
   }, 20_000);
 });
 

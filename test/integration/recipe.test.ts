@@ -94,6 +94,29 @@ describe('a recipe that reveals a link', () => {
     const host: RecipeHost = await startRecipeHost({ mode: 'reveal', body: BODY, filename: 'revealed.bin' });
     try {
       const id = await fetchRecipe(gh.url, host.url, 'reveal');
+
+      /**
+       * Dedupe, asserted at the ONLY point it is reachable: while the first job is still
+       * running.
+       *
+       * The record's `url` is the recipe's startUrl, which is what keeps dedupe, the logs and
+       * `/gh/jobs/:id` working unchanged. `findOpen` matches only UNSETTLED records, so this
+       * has to go out now — a second POST issued after the job settles cannot fold, mints a
+       * fresh id, and submits a second real recipe job against a host this test is about to
+       * close. The margin is wide: this request is on the wire within a millisecond of the
+       * first 202, and the job it folds onto has a window to open, a page to load, a 300ms
+       * reveal to wait out and half a megabyte to fetch before it settles.
+       *
+       * What this cannot see is the submit count — `test/unit/gh.test.ts` ("dedupes an
+       * in-flight request for the same target") holds that half, asserting one submit.
+       */
+      const again = await post(gh.url, { recipe: recipeFor(host.url), site: 'reveal' });
+      expect(again.status).toBe(202);
+      const folded = (await again.json()) as { jobId: string; state: string };
+      expect(folded.jobId, 'the second POST minted a new job instead of folding onto the first').toBe(id);
+      expect(SETTLED, `the first job settled before the second POST could fold onto it`)
+        .not.toContain(folded.state);
+
       const done = await settle(gh.url, id);
 
       expect(done.error).toBeUndefined();
@@ -104,11 +127,6 @@ describe('a recipe that reveals a link', () => {
       expect(done.result!.size).toBe(BODY.length);
       expect((await stat(done.result!.path)).size).toBe(BODY.length);
       expect(done.result!.filename).toBe('revealed.bin');
-
-      // The record's `url` is the recipe's startUrl, which is what keeps dedupe, the logs and
-      // `/gh/jobs/:id` working unchanged — and a second POST of the same recipe folds onto it.
-      const again = await post(gh.url, { recipe: recipeFor(host.url), site: 'reveal' });
-      expect(again.status).toBe(202);
 
       await fetch(`${gh.url}/gh/jobs/${id}`, { method: 'DELETE' });
     } finally {

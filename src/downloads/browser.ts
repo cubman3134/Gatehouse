@@ -702,9 +702,21 @@ export async function browserDownload(
              *
              * On the SENDER first: `ipcMain` is process-wide, so every concurrent recipe
              * window answers on this one channel and a sibling's reply would otherwise be read
-             * as ours. Then on the sequence, which is what stops a reply that arrived after its
-             * own step timed out from being handed to the NEXT step as if it were about that
-             * step's selector.
+             * as ours — a job settling on another job's derived URL, which is not something an
+             * operator could ever diagnose from a log line. Two recipe downloads running at
+             * once is ordinary, so this filter is load-bearing today; the two-window test in
+             * `test/unit/recipe-bridge.test.ts` is what holds it.
+             *
+             * Then on the SEQUENCE, which is defence in depth rather than a live guard. The
+             * hazard it describes — a reply arriving after its own step timed out, handed to
+             * the NEXT step as if it were about that step's selector — is unreachable as the
+             * code stands: a timed-out step settles `{ ok: false }` and `runRecipe` returns on
+             * the first non-ok result, so there is no later step for a stale reply to land on.
+             * It stays because that unreachability rests entirely on one decision in
+             * `runRecipe`; a step timeout that ever stopped being fatal would make a stale
+             * reply readable as the next step's answer, silently. What the check does earn
+             * today is the narrower half of the same rule, which `test/unit/recipe-bridge.test.ts`
+             * pins: a late reply for an already-settled step is dropped rather than thrown.
              */
             const onResult = (event: { sender: { id: number } }, ...args: unknown[]): void => {
               if (event.sender.id !== wc.id) return;
