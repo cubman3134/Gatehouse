@@ -53,6 +53,43 @@ describe('planResume', () => {
     expect(planResume(rec({ resume: full }), 0).kind).toBe('restart');
   });
 
+  it('floors a fractional startTime, which Chromium rejects', () => {
+    const p = planResume(rec({ resume: { ...full, startTimeSec: 1_700_000_000.75 } }), 40);
+    expect(p.kind).toBe('resume');
+    if (p.kind === 'resume') expect(p.args.startTime).toBe(1_700_000_000);
+  });
+
+  it('carries the rest of the args Chromium needs', () => {
+    const p = planResume(rec({ resume: full }), 40);
+    expect(p.kind).toBe('resume');
+    if (p.kind === 'resume') {
+      expect(p.args.mimeType).toBe('application/octet-stream');
+      expect(p.args.length).toBe(100);
+      expect(p.args.lastModified).toBe('Wed, 21 Oct 2015 07:28:00 GMT');
+    }
+  });
+
+  it('restarts when the partial already reaches the claimed size', () => {
+    const p = planResume(rec({ resume: full }), 100);
+    expect(p.kind).toBe('restart');
+    if (p.kind === 'restart') expect(p.reason).toMatch(/already at or larger/i);
+  });
+
+  it('restarts when no url chain was recorded', () => {
+    const p = planResume(rec({ resume: { ...full, urlChain: [] } }), 40);
+    expect(p.kind).toBe('restart');
+  });
+
+  it('does not misfire the size guard when there is no Content-Length', () => {
+    // totalBytes 0 means "the server did not say" — normal for brotli, not an error.
+    const p = planResume(rec({ resume: { ...full, totalBytes: 0 } }), 40);
+    expect(p.kind).toBe('resume');
+  });
+
+  it('restarts when the partial size is negative', () => {
+    expect(planResume(rec({ resume: full }), -1).kind).toBe('restart');
+  });
+
   it('restarts when the partial is larger than the file claimed to be', () => {
     const p = planResume(rec({ resume: full }), 500);
     expect(p.kind).toBe('restart');
@@ -60,6 +97,9 @@ describe('planResume', () => {
   });
 
   it('uses the ACTUAL partial size as the offset, not the recorded counter', () => {
+    // Unconditional first: without this the whole body sits inside a type narrow and the test
+    // passes against an implementation that returns `restart` for this input.
+    expect(planResume(rec({ resume: { ...full, receivedBytes: 12 } }), 40).kind).toBe('resume');
     // The recorded counter is throttled and can lag; the file on disk is the truth.
     const p = planResume(rec({ resume: { ...full, receivedBytes: 12 } }), 40);
     if (p.kind === 'resume') expect(p.args.offset).toBe(40);

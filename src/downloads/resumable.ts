@@ -35,8 +35,14 @@ export function planResume(rec: DownloadRecord, partialBytes: number): ResumePla
   if (!meta.eTag && !meta.lastModified) {
     return { kind: 'restart', reason: 'the server gave no validator (no eTag, no lastModified)' };
   }
-  if (meta.totalBytes > 0 && partialBytes > meta.totalBytes) {
-    return { kind: 'restart', reason: 'the partial is larger than the file claimed to be' };
+  if (meta.urlChain.length === 0) {
+    return { kind: 'restart', reason: 'no url chain was recorded' };
+  }
+  // `>=`, not `>`: a partial that already reaches the claimed size has nothing left to fetch,
+  // and asking Chromium to continue from `offset === length` gets a 416 and an interrupted
+  // download. We cannot simply finalise it either — the bytes are unverified — so start over.
+  if (meta.totalBytes > 0 && partialBytes >= meta.totalBytes) {
+    return { kind: 'restart', reason: 'the partial is already at or larger than the claimed size' };
   }
 
   return {

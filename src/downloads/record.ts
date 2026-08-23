@@ -16,7 +16,12 @@ export interface ResumeMetadata {
   lastModified: string;
   /** Floored to integer seconds — Chromium rejects a fractional startTime. */
   startTimeSec: number;
-  /** 0 when the server sent no Content-Length. */
+  /**
+   * 0 when the server sent no Content-Length. **Chromium's convention, not ours** — the
+   * record's own `size` uses -1 for the same fact. Do NOT copy one into the other: a -1
+   * here sails past a `totalBytes > 0` check as "no Content-Length" and then goes to
+   * Chromium as `length: -1`.
+   */
   totalBytes: number;
   receivedBytes: number;
 }
