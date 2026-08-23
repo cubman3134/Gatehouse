@@ -34,8 +34,9 @@ const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 /**
  * A `Requester` over Electron's `net`, issued on a named partition.
  *
- * This is the point of the whole increment. `net.request` with a `session` sends the bytes
- * down the same partition that solved the challenge, so they carry that partition's cookies
+ * This is the point of the whole increment. `net.request` with a `session` AND
+ * `useSessionCookies` sends the bytes down the same partition that solved the challenge, so
+ * they carry that partition's cookies
  * and Chromium's TLS/HTTP2 fingerprint — not Node's. A host that hands a `cf_clearance`
  * holder a file and hands Node a challenge page cannot tell this apart from the browser it
  * already let through, because it *is* that browser's network stack.
@@ -53,6 +54,13 @@ export function electronRequester(): Requester {
       const request = net.request({
         url: req.url,
         session: electronSession.fromPartition(`persist:${req.session}`),
+        // REQUIRED, and not the default. Electron's `net.request` sends NO cookies from the
+        // session unless this is set (`useSessionCookies` defaults to false) — passing
+        // `session` alone buys the partition's network stack but not its cookie jar. Without
+        // it every download of a challenge-protected file gets a 403, which is exactly what
+        // live verification found: the whole point of routing downloads through the browser
+        // is the `cf_clearance` this carries.
+        useSessionCookies: true,
       });
       for (const [k, v] of Object.entries(req.headers)) request.setHeader(k, v);
 
