@@ -8,7 +8,8 @@ export type FailureCode =
   | 'network'
   | 'cancelled'
   | 'browser-crashed'
-  | 'disk-full';
+  | 'disk-full'
+  | 'recipe-failed';
 
 export interface JobError {
   code: FailureCode;
@@ -48,6 +49,7 @@ const FAILURE_CODES: ReadonlySet<string> = new Set<FailureCode>([
   'cancelled',
   'browser-crashed',
   'disk-full',
+  'recipe-failed', // A recipe step matched nothing, timed out, or produced a URL the scheme gate refused; reporting as 'network' would be a lie.
 ]);
 
 /** A thrown value may carry a FailureCode; anything else is a network fault. */
