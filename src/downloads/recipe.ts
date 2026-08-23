@@ -31,6 +31,12 @@ function str(v: unknown, max: number): string | null {
 /**
  * Validate a caller-supplied recipe.
  *
+ * **What this cannot check:** whether a selector is valid CSS. That needs a DOM, and this
+ * module is deliberately free of Electron so it can be unit-tested without a browser. An
+ * invalid selector therefore passes here and throws from `querySelectorAll` at execution
+ * time — the executor is responsible for catching that and re-raising it with the step index,
+ * because "step 2 matched nothing" is the whole point of these messages.
+ *
  * Everything here is refused rather than coerced, and every message names the step index —
  * a recipe breaks when a site changes its markup, and "step 2 matched nothing" is the whole
  * difference between one log line and an afternoon.
@@ -65,9 +71,9 @@ export function validateRecipe(raw: unknown): Recipe | RecipeError {
     }
 
     if (step.op === 'click' || step.op === 'waitFor') {
-      if ('attribute' in step) return { message: `recipe step ${i}: ${step.op} takes no attribute` };
+      if (Object.hasOwn(step, 'attribute')) return { message: `recipe step ${i}: ${step.op} takes no attribute` };
       let text: string | undefined;
-      if ('text' in step) {
+      if (Object.hasOwn(step, 'text')) {
         const t = str(step.text, MAX_TEXT);
         if (t === null) return { message: `recipe step ${i}: text must be a string of 1..${MAX_TEXT} characters` };
         text = t;
@@ -77,7 +83,7 @@ export function validateRecipe(raw: unknown): Recipe | RecipeError {
     }
 
     if (step.op === 'readAttribute') {
-      if ('text' in step) return { message: `recipe step ${i}: readAttribute takes no text` };
+      if (Object.hasOwn(step, 'text')) return { message: `recipe step ${i}: readAttribute takes no text` };
       const attribute = typeof step.attribute === 'string' ? step.attribute : '';
       if (!ATTRIBUTE.test(attribute)) {
         return { message: `recipe step ${i}: attribute is not a valid attribute name` };
@@ -86,7 +92,12 @@ export function validateRecipe(raw: unknown): Recipe | RecipeError {
       continue;
     }
 
-    return { message: `recipe step ${i}: unknown op ${JSON.stringify(step.op)}` };
+    // NOT JSON.stringify: it throws on a BigInt, on a circular object, and on one whose
+    // toJSON throws — and this function's contract is that it REFUSES rather than throws.
+    // Unreachable from a JSON body today, but the signature says `unknown` and callers will
+    // reasonably treat it as total.
+    const shown = typeof step.op === 'string' ? JSON.stringify(step.op) : typeof step.op;
+    return { message: `recipe step ${i}: unknown op ${shown}` };
   }
 
   // A recipe that runs to completion has to end with something that yields a URL. The other

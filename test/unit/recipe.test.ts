@@ -41,6 +41,13 @@ describe('validateRecipe', () => {
     expect(isRecipeError(validateRecipe({ ...ok, steps: [] }))).toBe(true);
   });
 
+  it('accepts exactly MAX_STEPS', () => {
+    // Rejection alone does not catch an off-by-one in the comparison.
+    const steps = Array.from({ length: MAX_STEPS - 1 }, () => ({ op: 'waitFor', selector: 'a' }));
+    steps.push({ op: 'readAttribute', selector: 'a', attribute: 'href' } as never);
+    expect(isRecipeError(validateRecipe({ ...ok, steps }))).toBe(false);
+  });
+
   it('refuses more than MAX_STEPS', () => {
     const many = Array.from({ length: MAX_STEPS + 1 }, () => ({ op: 'waitFor', selector: 'a' }));
     many[many.length - 1] = { op: 'readAttribute', selector: 'a', attribute: 'href' } as never;

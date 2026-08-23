@@ -246,6 +246,9 @@ describe('JobQueue', () => {
     const codes = [
       'challenge-failed', 'pending-timeout', 'blocked', 'http-error',
       'network', 'cancelled', 'browser-crashed', 'disk-full',
+      // Recipe failures name the step that went stale. Omitting this here is what would let
+      // FAILURE_CODES lose the code and silently rewrite every one of them to `network`.
+      'recipe-failed',
     ];
 
     for (const code of codes) {
