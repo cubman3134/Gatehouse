@@ -28,13 +28,30 @@ export type Verdict = 'clear' | 'challenged' | 'blocked';
 const BLOCK_MARKERS = ['error code: 1020', 'error 1020', 'error code: 1015', 'error 1015'] as const;
 /**
  * Cloudflare challenge interstitial markers — every one of these means "keep waiting",
- * including the Turnstile ones (see the note on `Verdict`). Removed: 'just a moment' (too
- * generic, appears in cleared pages like "Just a moment, loading your cart"; covered by
- * challenge-form, challenge-platform, cf_chl_opt, and the cf-mitigated header).
+ * including the Turnstile ones (see the note on `Verdict`).
+ *
+ * **Removed, each because it appears on pages that are not challenged at all:**
+ *
+ * - `just a moment` — ordinary English; matches copy like "Just a moment, loading your cart".
+ * - `challenge-platform` — **measured on a live HTTP 200 page with no challenge involved**
+ *   (romhackplaza.org, 2026-08-23: plain `curl` got the real page, and it carried this).
+ *   Cloudflare injects `/cdn-cgi/challenge-platform/...` for *invisible bot management* on
+ *   ordinary pages, not only on interstitials. Treating it as a challenge made the solve loop
+ *   poll a perfectly clear page until its deadline and then fail — on any Cloudflare-fronted
+ *   site using bot management, which is most of them.
+ *
+ * What is left is interstitial-specific: `cf_chl_opt` is the challenge options object and
+ * `challenge-form` is the interstitial's own form. The authoritative signal is the
+ * `cf-mitigated: challenge` header, checked before this list.
+ *
+ * **Known residual risk, not yet measured:** the two Turnstile markers have the same shape of
+ * problem — a *cleared* page carrying a Turnstile widget on a login or comment form would be
+ * read as challenged and poll to the deadline. They are kept because no such page has been
+ * measured, and because dropping them risks calling a real interstitial clear. If a site is
+ * ever seen hanging with a Turnstile widget on a 200, this is the first place to look.
  */
 const CHALLENGE_MARKERS = [
   'challenge-form',
-  'challenge-platform',
   'cf_chl_opt',
   'cf-turnstile',
   'challenges.cloudflare.com/turnstile',

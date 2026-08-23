@@ -41,6 +41,30 @@ describe('classify', () => {
    * Judging it terminal aborted a solve that succeeded a second later. It must stay
    * `challenged` — i.e. keep polling.
    */
+  /**
+   * THE OTHER REGRESSION, measured against romhackplaza.org on 2026-08-23. A plain `curl` got
+   * the real page with HTTP 200 and no challenge of any kind — and that page carried
+   * `challenge-platform`, because Cloudflare injects it for INVISIBLE BOT MANAGEMENT on
+   * ordinary pages, not only on interstitials.
+   *
+   * While it counted as a challenge marker, the solve loop polled this perfectly clear page
+   * until its 70s deadline and then failed `challenge-failed` — on any Cloudflare-fronted site
+   * using bot management, which is most of them.
+   */
+  it('calls a clean 200 carrying only challenge-platform CLEAR, not challenged', () => {
+    const html = `<html><head><title>A normal page</title>
+      <script src="/cdn-cgi/challenge-platform/h/g/scripts/jsd/main.js"></script></head>
+      <body><h1>real content</h1></body></html>`;
+
+    expect(classify(snap({ status: 200, headers: {}, html }))).toBe('clear');
+  });
+
+  it('still calls it challenged when the authoritative header says so', () => {
+    // The header is what actually distinguishes a challenge; the script tag never did.
+    const html = '<script src="/cdn-cgi/challenge-platform/h/g/scripts/jsd/main.js"></script>';
+    expect(classify(snap({ status: 403, headers: { 'cf-mitigated': 'challenge' }, html }))).toBe('challenged');
+  });
+
   it('calls the real managed-challenge snapshot (turnstile + challenge-platform) challenged, never terminal', () => {
     const html = `<html><head>
       <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></head>
@@ -82,7 +106,8 @@ describe('classify', () => {
     ['cf-turnstile', 'challenged'],
     ['challenges.cloudflare.com/turnstile', 'challenged'],
     ['challenge-form', 'challenged'],
-    ['challenge-platform', 'challenged'],
+    // NOT challenged — see the regression test below and the note in detect.ts.
+    ['challenge-platform', 'clear'],
     ['cf_chl_opt', 'challenged'],
   ])('exercises individual markers: "%s" → %s', (marker, expected) => {
     expect(classify(snap({ html: marker }))).toBe(expected);
