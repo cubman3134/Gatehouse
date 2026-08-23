@@ -1,6 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    // Pinned. Without it, target ES2022 pulls lib.es2022.FULL, which includes DOM — so every
+    // module in this Node/Electron-main program silently gets `document`, `window` and friends
+    // in scope. The one place that legitimately touches the DOM is the recipe preload, which
+    // is hand-written .cjs and outside this program entirely.
+    "lib": ["ES2022"],
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "outDir": "dist",
