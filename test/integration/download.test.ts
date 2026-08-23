@@ -120,9 +120,11 @@ describe('the /gh/* surface on the real app', () => {
    * a 5s stall window (the configured minimum) so the test does not sit through the 120s
    * default. The no-start window is pinned high so what fires here is unambiguously the idle
    * watchdog and not `browserDownload`'s own request-phase timer, which would settle the same
-   * record with a different message. The assertion is not just "the stalled job settled" — it
-   * is that the job queued BEHIND it then ran to completion, which is what "the slot was
-   * freed" actually means.
+   * record with a different message. That inversion — stall window below no-start window — is
+   * the ordering dependence documented on the pair in `config.ts`: this host is inside both
+   * windows at once and the shorter one is what reports it. The assertion is not just "the
+   * stalled job settled" — it is that the job queued BEHIND it then ran to completion, which is
+   * what "the slot was freed" actually means.
    */
   it('aborts a download that has gone idle, and frees the slot for the next one', async () => {
     const silentHost = await startFileHost({ mode: 'no-headers' });
@@ -174,7 +176,10 @@ describe('the /gh/* surface on the real app', () => {
       const stalled = await settleWithin(silent, 20_000);
       expect(stalled.state).toBe('failed');
       expect(stalled.error!.code).toBe('network');
-      expect(stalled.error!.message).toMatch(/no bytes arrived/i);
+      // The message names what the watchdog actually measures — `received` stopped advancing
+      // — rather than "no bytes arrived", which would be the wrong description of a download
+      // abandoned at 3GB. It is true of this host too: nothing ever advanced.
+      expect(stalled.error!.message).toMatch(/stopped advancing/i);
 
       // The slot really was freed: the job behind it ran, and ran to completion.
       const next = await settleWithin(behind, 30_000);

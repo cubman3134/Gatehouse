@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtemp, rm, stat, readdir } from 'node:fs/promises';
+import { mkdtemp, rm, stat, readdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -282,10 +282,87 @@ describe('a host that never starts the download', () => {
       // and emphatically not forever.
       expect(took).toBeLessThan(25_000);
       expect((await readdir(silentDir)).filter((f) => f.startsWith(silentId))).toEqual([]);
+      // `completedAt` is stamped on the FAILURE rather than left null, and the retention sweep
+      // is why it matters: it ages a record from `completedAt ?? createdAt`, so a failure
+      // without one would be aged from the moment the download STARTED. A transfer that ran
+      // longer than the TTL before dying would then be reclaimable the instant it settled, and
+      // could vanish before the caller polled. Nothing on `/gh/jobs/:id` exposes the field, so
+      // this reads the manifest — which is the same file the sweep reads.
+      const manifest = JSON.parse(
+        await readFile(join(silentDir, 'manifest.json'), 'utf8'),
+      ) as Array<{ id: string; state: string; createdAt: number; completedAt: number | null }>;
+      const record = manifest.find((r) => r.id === silentId);
+      expect(record, 'the failed record is not in the manifest').toBeDefined();
+      expect(record!.state).toBe('failed');
+      expect(record!.completedAt).not.toBeNull();
+      expect(record!.completedAt!).toBeGreaterThanOrEqual(record!.createdAt);
     } finally {
       await app.stop();
       await silent.close();
       await rm(silentDir, { recursive: true, force: true });
     }
   }, 120_000);
+});
+
+/**
+ * A `DELETE` on a job that is still QUEUED — the ordinary client action of changing its mind
+ * before a slot opens, and the one that reaches the engine's pre-item cancel branch.
+ *
+ * It is a different path from the mid-body cancel above, and the difference is where the abort
+ * lands. There, an item exists and Chromium's `cancel()` settles the record from its `done`.
+ * Here nothing has started: the engine sees an already-aborted signal on the way in, settles
+ * `cancelled` and never opens a window or a socket at all. The wiring that makes that work is
+ * that the AbortController is created at SUBMIT time, not when the queue reaches the job — a
+ * fresh controller in the runner would drop this cancel on the floor and the download would go
+ * ahead and complete.
+ *
+ * Its own app: one download slot, so the first job genuinely starves the second, and a 5s
+ * no-start window so the blocker lets go without the test sitting through the 60s default.
+ */
+describe('cancelling a job that has not started yet', () => {
+  it('settles a still-queued job cancelled without ever downloading anything', async () => {
+    // Accepts the socket and says nothing, so it holds the only slot for the whole no-start
+    // window with no bytes involved.
+    const blocker = await startFileHost({ mode: 'no-headers' });
+    // A host that WOULD serve the file, which is what gives the assertion its teeth: if the
+    // cancel were lost, this job settles `done` with 64K on disk rather than `cancelled`.
+    const willing = await startFileHost({ body: Buffer.alloc(64 * 1024, 3), filename: 'ok.bin' });
+    const queuedDir = await mkdtemp(join(tmpdir(), 'gh-qcancel-'));
+    const app = await startGatehouse({
+      GATEHOUSE_DOWNLOADS_DIR: queuedDir,
+      GATEHOUSE_DOWNLOAD_CONCURRENCY: '1',
+      GATEHOUSE_DOWNLOAD_NO_START_MS: '5000',
+      GATEHOUSE_DOWNLOAD_STALL_MS: '60000',
+    });
+    try {
+      const blocked = await fetchJob(app.url, blocker.url, 'blocker');
+      const victim = await fetchJob(app.url, willing.url, 'victim');
+
+      // The premise. Without it this test would silently degrade into the mid-body cancel,
+      // which is already covered and proves something else.
+      await new Promise((r) => setTimeout(r, 1_000));
+      expect((await job(app.url, blocked)).state).toBe('running');
+      expect((await job(app.url, victim)).state, 'the victim got a slot, so this is not a queued cancel').toBe('queued');
+
+      expect((await fetch(`${app.url}/gh/jobs/${victim}`, { method: 'DELETE' })).status).toBe(204);
+      // The `204` says the cancel was REQUESTED. Nothing is running to interrupt, so the record
+      // stays open until the queue reaches it — documented behaviour, asserted here.
+      expect((await job(app.url, victim)).state).toBe('queued');
+
+      const settled = await settle(app.url, victim, 40_000);
+      expect(settled.state).toBe('cancelled');
+      expect(settled.error!.code).toBe('cancelled');
+      // Never downloaded: no `.bin`, no `.part`, nothing under this id at all.
+      expect((await readdir(queuedDir)).filter((f) => f.startsWith(victim))).toEqual([]);
+
+      // And the blocker settled on its own timer, so the slot was never the thing holding the
+      // victim by the time it was cancelled.
+      expect((await settle(app.url, blocked, 40_000)).state).toBe('failed');
+    } finally {
+      await app.stop();
+      await blocker.close();
+      await willing.close();
+      await rm(queuedDir, { recursive: true, force: true });
+    }
+  }, 150_000);
 });

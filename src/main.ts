@@ -149,7 +149,19 @@ async function start(): Promise<void> {
    *
    * It overlaps `browserDownload`'s own no-start timer without duplicating it. That one bounds
    * the REQUEST phase, where there is no item at all; this one bounds an item that exists and
-   * has stopped moving. Both are needed and they name different faults.
+   * has stopped moving. Both are needed, and each names the fault it measures.
+   *
+   * WHICH of the two names a given fault is an ordering question, though, and the config does
+   * not settle it. This watchdog seeds its clock unconditionally, so it does not need an item
+   * to fire: a host that accepts the socket and never writes a status line is inside BOTH
+   * windows at once, and whichever elapses first is the one that reports it. With the defaults
+   * (60s no-start, 120s stall) that is the no-start timer, which is the tighter bound and the
+   * more precise description. Configure `GATEHOUSE_DOWNLOAD_STALL_MS` below
+   * `GATEHOUSE_DOWNLOAD_NO_START_MS` — which is allowed, and which
+   * `test/integration/download.test.ts` does deliberately, to reach this watchdog in a bounded
+   * test — and a request-phase hang is reported here instead, as a download that stopped
+   * advancing. Not wrong (it never advanced), but less specific than the timer that would have
+   * said "nothing ever began". See the note on the pair in `config.ts`.
    *
    * IDLE, not total: the clock is reset by progress, so a legitimate multi-GB download may run
    * for hours. It fires only when `received` has not moved for a whole window. The engine
@@ -267,7 +279,19 @@ async function start(): Promise<void> {
   // `http://0.0.0.0:8191` connects nowhere useful. Advertise the loopback the wildcard covers.
   const host = WILDCARD_LOOPBACK[cfg.bind] ?? cfg.bind;
   process.stdout.write(`GATEHOUSE_READY http://${host}:${server.port}\n`);
-  app.on('before-quit', () => { clearInterval(sweepTimer); pool.destroy(); void server.close(); });
+  app.on('before-quit', () => {
+    clearInterval(sweepTimer);
+    pool.destroy();
+    // `void`ed, so the `catch` is not optional. `close()` rejects with ERR_SERVER_NOT_RUNNING
+    // if anything already closed the listener — a second quit signal, or a listen that never
+    // came up — and on the way out of the process an unhandled rejection is the last thing an
+    // operator needs in the log. There is nothing to do about it but say so.
+    void server.close().catch((e: unknown) => {
+      log.warn('the HTTP server did not close cleanly', {
+        message: e instanceof Error ? e.message : String(e),
+      });
+    });
+  });
 }
 
 // Startup runs entirely inside the guard. loadConfig, the pool and the solver used to sit

@@ -48,7 +48,7 @@ export interface DownloadRecord {
   completedAt: number | null;
   /** Bumped whenever the bytes are served, so the size-cap sweep can evict least-recently-used. */
   lastAccessAt: number;
-  /** Present once a transfer has started and reported its headers. */
+  /** Present once a download has started and its headers have been read off the item. */
   resume?: ResumeMetadata;
 }
 

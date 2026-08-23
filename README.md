@@ -119,6 +119,15 @@ nothing to cancel. Both are needed and they report different messages, so a log 
 happened. It can be much tighter than the stall window because it is not competing with the
 4 MB progress throttle: nothing has been received yet.
 
+**Which of the two names a request-phase hang depends on their ordering, and nothing enforces
+one.** The stall watchdog starts its clock when the job does rather than waiting for an item, so
+a host that never sends a status line is inside *both* windows and whichever is shorter reports
+it. At the defaults that is `GATEHOUSE_DOWNLOAD_NO_START_MS`, which is the more precise answer
+— "the download never started". Set `GATEHOUSE_DOWNLOAD_STALL_MS` below it and the same host is
+reported as a download that stopped advancing instead: true, since it never advanced, but less
+specific. No relationship is imposed because the inversion is useful — it is how the test suite
+reaches the watchdog without sitting through a 60s request phase.
+
 **Auth.** A loopback bind takes no auth, because FlareSolverr clients send no
 `Authorization` header and requiring one would break drop-in compatibility on day one.
 Binding anywhere else without `GATEHOUSE_TOKEN` is refused at startup rather than
@@ -421,20 +430,36 @@ directly below.
 
 The download path has **never been run against a real content source, and never against a
 multi-GB file.** One real challenge-protected file was fetched by hand during the verification
-above, and that is the whole of it. Every test here runs against a local fixture HTTP server in
-`test/fixture/` that serves a few megabytes and can be told to truncate, stall, answer chunked,
-or accept the socket and say nothing. That fixture proves the *mechanism* — completion and
-hashing, two concurrent downloads not crossing, cancel, the no-start bound, the unknown-total
-translation, dedupe and Range serving. It cannot prove behaviour at 4GB, on a slow or flaky
-link, or against a host that is actually trying to tell a browser from a script.
+above, and that is the whole of it. Every integration test here runs against a local fixture
+HTTP server in `test/fixture/` that serves a few megabytes and can answer a range, answer
+chunked with no length at all, or accept the socket and say nothing. That fixture proves the
+*mechanism* — completion and hashing, two concurrent downloads not crossing, cancel both
+mid-body and while still queued, the no-start bound, the idle watchdog freeing a wedged slot,
+the unknown-total translation, dedupe and Range serving. It cannot prove behaviour at 4GB, on a
+slow or flaky link, or against a host that is actually trying to tell a browser from a script.
 
 The restart-resume path above is the **least** proven thing here, and it is worth saying so
 plainly. The *decision* about what to re-queue is unit-tested against a hand-built manifest, and
-the decision about whether a partial may be continued is unit-tested in `resumable.ts`. What has
-no automated end-to-end coverage is a real kill-the-app-mid-body-and-restart against a host that
+the decision about whether a partial may be continued is unit-tested in `resumable.ts`. The
+*wiring* — arming the one-shot, the save-path tripwire, the arguments handed to
+`createInterruptedDownload`, and what happens when the call produces no item — is unit-tested in
+`test/unit/browser.test.ts` against a **fake** session, because that call's `will-download`
+emission is synchronous inside the call and nothing over HTTP can arrange for it. What has no
+automated end-to-end coverage is a real kill-the-app-mid-body-and-restart against a host that
 sends a validator — and since the one real host measured sends neither `eTag` nor
-`Last-Modified`, the branch that actually continues a partial has never run against anything but
-a fixture.
+`Last-Modified`, the branch that actually continues a partial has never run against real
+Chromium at all.
+
+Three smaller things nothing here proves:
+
+- **A genuine mid-body stall.** The idle watchdog is tested against a host that never sends a
+  status line, which reaches it through the ordering described under the settings above. An item
+  that exists, moves, and *then* stops — the case the failure message describes — is not
+  exercised.
+- **`ENOSPC` → `disk-full`.** The mapping is unit-tested by making the window factory throw with
+  that errno. No test fills a disk.
+- **The `updated` progress throttle at scale.** It is observed advancing across a 12MB chunked
+  body; the 4MB spacing itself is not asserted.
 
 Two specifics worth knowing before you rely on it. Hashing is a **second pass** over the
 finished file rather than a streaming digest, so a large download is read from disk twice

@@ -20,9 +20,18 @@ export interface GatehouseConfig {
   /**
    * How long to wait for a download to begin at all before giving up.
    *
-   * A different fault from a stall, and a tighter bound: a host that accepts the socket and
-   * then writes nothing never fires `will-download`, so there is no item, no bytes and
-   * nothing for the idle watchdog to name. This one names it — nothing ever began.
+   * A different fault from a stall, and normally a tighter bound: a host that accepts the
+   * socket and then writes nothing never fires `will-download`, so there is no item and no
+   * bytes. This one names that precisely — nothing ever began.
+   *
+   * **The two are deliberately not constrained against each other, and the ordering decides
+   * which one speaks.** The idle watchdog seeds its clock unconditionally rather than waiting
+   * for an item, so a request-phase hang is inside both windows at once and the shorter one
+   * reports it. At the defaults (60s here, 120s there) that is this timer. Set
+   * `GATEHOUSE_DOWNLOAD_STALL_MS` lower than this and the same host settles as a download that
+   * stopped advancing instead — true, but less specific. No relationship is enforced because
+   * the inversion is genuinely useful: it is how a test reaches the watchdog without sitting
+   * through a 60s request phase.
    */
   downloadNoStartMs: number;
   /** How long a completed download's bytes survive without being released. */

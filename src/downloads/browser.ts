@@ -9,16 +9,6 @@ import { STALLED } from './stalled.js';
 import { log } from '../log.js';
 
 /**
- * The stall abort reason, re-exported so this module reads as self-contained.
- *
- * It is deliberately not minted here: it is minted once, in `stalled.ts`, and `transfer.ts`
- * re-exports that same binding. Identity is the whole mechanism and a second mint would compare
- * unequal while printing identically, so whichever engine the watchdog in `main.ts` is wired
- * to, both sides are looking at one symbol. See `stalled.ts` for why that failure is silent.
- */
-export { STALLED } from './stalled.js';
-
-/**
  * How many bytes may arrive before progress is persisted again.
  *
  * Progress goes into the manifest, and the manifest is rewritten and renamed on every update,
@@ -129,7 +119,8 @@ export async function browserDownload(
   /**
    * `completedAt` is stamped on a failure rather than left null. The retention sweep ages a
    * record from `completedAt ?? createdAt`, so without it a failure's TTL would run from when
-   * the download *started* and a long transfer's partial could be reclaimed within minutes.
+   * the download *started* — and a download that ran for longer than the TTL before dying would
+   * be reclaimable the instant it settled, its record gone before the caller's next poll.
    */
   const failedPatch = (
     code: FailureCode,
@@ -199,18 +190,26 @@ export async function browserDownload(
 
     /**
      * A stall is a retryable HOST fault the caller never asked for, so it settles `failed` /
-     * `network` — which is also what lets a re-POST reclaim the record rather than mint a new
-     * id. Reporting it as `cancelled` would be a lie about who acted.
+     * `network` rather than `cancelled`, which would be a lie about who acted. It is a settled
+     * state like any other: there is no reclaim of it, and a re-POST for the same target mints
+     * a fresh id and starts from zero.
      *
-     * It cannot keep its bytes, though, and that is worth knowing: the only way to end a stalled
-     * browser download is `cancel()`, and Chromium deletes the partial on cancel. So unlike the
-     * byte-stream transfer, a stall here leaves nothing to resume from — the reclaim finds no
-     * `.part` and starts over.
+     * It keeps no bytes either. The only way to end a stalled browser download is `cancel()`,
+     * and Chromium deletes the partial of an item it cancelled, so a stalled record settles
+     * with nothing on disk.
+     *
+     * The message names the fault as the watchdog measures it: `received` stopped advancing.
+     * NOT "no bytes arrived" — the window is idle, not total, so a download abandoned at 3GB
+     * reaches here too and that phrasing would describe the wrong thing entirely.
      */
     const settleStalled = async (received: number): Promise<void> => {
       log.warn('download abandoned after a stall', { id, received, stallMs: deps.stallMs });
       await finish(
-        failedPatch('network', `no bytes arrived within ${deps.stallMs}ms`, received),
+        failedPatch(
+          'network',
+          `the download stopped advancing for ${deps.stallMs}ms`,
+          received,
+        ),
       );
     };
 
@@ -306,11 +305,23 @@ export async function browserDownload(
               } else {
                 // `interrupted`, or a `cancelled` nobody here asked for. The HTTP status is not
                 // exposed anywhere on the item — a 404 arrives as an interrupt with 0 bytes and
-                // no file — so there is no code to report beyond this. The partial, if any, is
-                // KEPT: that is what a later resume continues from.
+                // no file — so there is no code to report beyond this.
+                //
+                // The partial, if any, GOES. Nothing can read it: the record settles `failed`,
+                // which is settled, so `findOpen` will not return it and a re-POST mints a new
+                // id; and the one resume caller there is — `requeueInterrupted` — matches only
+                // a record `load()` demoted, on `code === 'cancelled'` plus
+                // INTERRUPTED_BY_RESTART. Keeping the bytes would leave a file with no reader,
+                // occupying the cap until the TTL sweep reclaimed it.
+                //
+                // The genuinely resumable case is a different one and is untouched by this: a
+                // record still `running` when the process DIES leaves its `.part` behind
+                // because nothing here ever runs, `load()` demotes it, and the resume picks it
+                // up on the next start.
                 const received = receivedOf(dl);
                 log.warn('download did not complete', { id, state, received });
                 await finish(failedPatch('network', `the download ${state}`, received));
+                await dropPartial();
               }
             } catch (e: unknown) {
               // Nothing here may escape. This IIFE is detached, so a throw would surface as an
