@@ -9,8 +9,24 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 export interface Harness {
   url: string;
+  /**
+   * Everything the app has written to stdout and stderr, most recent `MAX_OUTPUT` bytes.
+   *
+   * The app's own log is the only view a test has of decisions that leave no trace in the HTTP
+   * surface. Discarding a second, unclaimed download item is one: the job completes on its
+   * first item either way, and what separates "claimed and cancelled it" from "let Chromium do
+   * whatever it likes with it" is a line in this log.
+   */
+  output(): string;
   stop(): Promise<void>;
 }
+
+/**
+ * How much of the app's output is kept. A cap rather than the lot, because both pipes are
+ * drained for the child's whole life and a long download run is chatty; the tail is the part a
+ * failure is ever about.
+ */
+const MAX_OUTPUT = 256 * 1024;
 
 /** Newest mtime under a directory tree, or 0 if it does not exist. */
 function newestTsMtime(dir: string): number {
@@ -82,6 +98,12 @@ export function startGatehouse(env: Record<string, string> = {}): Promise<Harnes
 
     let out = '';
     let settled = false;
+    /** The full log, kept past ready as well — see `Harness.output`. */
+    let full = '';
+    const record = (chunk: string): void => {
+      full += chunk;
+      if (full.length > MAX_OUTPUT) full = full.slice(full.length - MAX_OUTPUT);
+    };
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -102,10 +124,11 @@ export function startGatehouse(env: Record<string, string> = {}): Promise<Harnes
         child.kill();
       });
 
-    // Both pipes stay drained for the child's whole life — a full pipe buffer would block it
-    // — but only the pre-ready output is retained, since that is the only part any failure
-    // message quotes.
+    // Both pipes stay drained for the child's whole life — a full pipe buffer would block it.
+    // `out` holds only the pre-ready part, which is what a startup failure quotes; `full` keeps
+    // the tail of everything, which is what `output()` hands to a test.
     child.stdout.on('data', (b: Buffer) => {
+      record(b.toString());
       if (settled) return;
       out += b.toString();
       // The line terminator is part of the pattern: a chunk that splits mid-URL would
@@ -114,10 +137,13 @@ export function startGatehouse(env: Record<string, string> = {}): Promise<Harnes
       if (m) {
         settled = true;
         clearTimeout(timer);
-        resolvePromise({ url: m[1]!, stop });
+        resolvePromise({ url: m[1]!, stop, output: () => full });
       }
     });
-    child.stderr.on('data', (b: Buffer) => { if (!settled) out += b.toString(); });
+    child.stderr.on('data', (b: Buffer) => {
+      record(b.toString());
+      if (!settled) out += b.toString();
+    });
     // A spawn failure (ENOENT, EACCES) emits 'error' and nothing else. Without this the
     // error is rethrown out of the child process machinery and kills the vitest worker
     // instead of failing the test that asked for the harness.

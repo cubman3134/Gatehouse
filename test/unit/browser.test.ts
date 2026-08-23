@@ -398,3 +398,56 @@ describe('resuming a partial through createInterruptedDownload', () => {
     expect(after.completedAt).toBe(7777);
   });
 });
+
+describe('the signal that a transfer has begun', () => {
+  /**
+   * `onItemAdopted` exists for one caller — the idle stall watchdog in `main.ts`, which restarts
+   * its clock on it.
+   *
+   * Without it that clock spans everything in front of the transfer: the window, the page load
+   * and, on a recipe, every step. At the shipped defaults those add up to the whole stall window
+   * on their own (60s of recipe + 60s of no-start = the 120s stall window, exactly), so a recipe
+   * that legitimately spent its budget would hand a just-started download a window of nothing
+   * and settle it `network` / "stopped advancing" — a lie about a transfer that had not yet had
+   * a chance to advance at all.
+   *
+   * It fires from `adopt`, so it means precisely "an item is ours now", on both start paths.
+   */
+  it('fires once when the item is adopted', async () => {
+    const id = 'adopt-1';
+    await seed(id);
+    const adopted: number[] = [];
+
+    await run(id, {
+      onItemAdopted: () => { adopted.push(Date.now()); },
+      makeWindow: () => fakeWindow((self) => {
+        const dl = new FakeItem();
+        // Two `updated` ticks before the end, so a signal wired to progress rather than to
+        // adoption would show up here as more than one call.
+        currentSession.emit('will-download', {}, dl.item, self.webContents);
+        dl.emit('updated');
+        dl.emit('updated');
+        dl.finish('interrupted');
+      }).window,
+    });
+
+    expect(adopted).toHaveLength(1);
+  });
+
+  /** No item, no transfer: a download that never starts must not restart anybody's clock. */
+  it('does not fire when no item ever arrives', async () => {
+    const id = 'adopt-2';
+    await seed(id);
+    let fired = 0;
+
+    await run(id, {
+      // Tight, because nothing will ever start and this timer is what ends the test.
+      noStartMs: 5_000,
+      onItemAdopted: () => { fired += 1; },
+      makeWindow: () => fakeWindow(() => { /* the host accepts the socket and says nothing */ }).window,
+    });
+
+    expect(store.get(id)!.error!.message).toMatch(/never started/);
+    expect(fired).toBe(0);
+  }, 20_000);
+});

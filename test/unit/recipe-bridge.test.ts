@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createContext, runInContext } from 'node:vm';
@@ -125,7 +126,16 @@ class FakeItem extends EventEmitter {
   getETag(): string { return ''; }
   getLastModifiedTime(): string { return ''; }
   getStartTime(): number { return 1_700_000_000; }
-  cancel(): void { this.cancelled += 1; }
+  /**
+   * Chromium DELETES the file of an item it cancelled — including a paused one — and the fake
+   * does it too, because that is the behaviour one of the tests below is about. An engine that
+   * pointed a doomed item at the ADOPTED item's `.part` would destroy the download it is
+   * keeping, and a fake that merely counted cancels could not tell.
+   */
+  cancel(): void {
+    this.cancelled += 1;
+    if (this.savePath) rmSync(this.savePath, { force: true });
+  }
   resume(): void {}
   /** What Chromium's own `done` is: the file is closed by the time this fires. */
   finish(state: string): void { this.emit('done', {}, state); }
@@ -190,6 +200,12 @@ async function runRecipeDownload(
     wcId?: number;
     /** Its own downloads directory, so two concurrent jobs do not share a manifest. */
     dir?: string;
+    /**
+     * What the window's own navigation does. The default resolves, as a load that committed.
+     * A rejection is a main document that failed — `ERR_NAME_NOT_RESOLVED` on a host that is
+     * not there, `ERR_ABORTED` on a page that navigated away from itself deliberately.
+     */
+    loadURL?: (rig: Rig) => Promise<void>;
   } = {},
 ): Promise<{ rec: ReturnType<DownloadStore['get']>; rig: Rig; elapsed: number; store: DownloadStore }> {
   const own = new DownloadStore({ dir: opts.dir ?? dir, now: () => Date.now(), idgen: () => id, ttlMs: 600_000, maxBytes: 1e9 });
@@ -215,7 +231,7 @@ async function runRecipeDownload(
   let stepsSent = 0;
   const webContents = {
     id: wcId,
-    loadURL: (): Promise<void> => Promise.resolve(),
+    loadURL: (): Promise<void> => (opts.loadURL ? opts.loadURL(rig) : Promise.resolve()),
     getURL: () => RECIPE.startUrl,
     send: (channel: string, ...args: unknown[]) => {
       if (channel !== STEP_CHANNEL) throw new Error(`the main side sent on ${channel}`);
@@ -597,5 +613,157 @@ describe('a recipe record picked back up after a restart', () => {
 
     expect(asked).toBe('http://host.test/file.bin');
     expect(store.get('restart-2')!.error!.code).toBe('network');
+  });
+});
+
+describe('a page that starts more than one download', () => {
+  const BODY = Buffer.from('the bytes of the download we are actually keeping');
+  const SHA = createHash('sha256').update(BODY).digest('hex');
+
+  /**
+   * **The fatal one, in miniature.**
+   *
+   * `will-download` fires on the SESSION, and a page may start as many downloads as it likes:
+   * two iframes, a handler bound twice, a script that loops `location.href`. The handler used
+   * to remove itself as soon as it adopted an item, so every later item from that same window
+   * reached the session unclaimed — a sibling job's handler rejects it on `webContents`, so
+   * NOTHING calls `setSavePath`, and the item becomes Chromium's to dispose of. Measured against
+   * the real app on Electron 43.4.1: the whole file goes into the USER'S Downloads folder under
+   * a UUID `.tmp` name, silently, outside the store and outside retention. The documented
+   * behaviour elsewhere is the native modal Save As dialog, which on a hidden window in a daemon
+   * never resolves at all. Neither is survivable, and one rule designs out both.
+   *
+   * So the listener stays attached for the window's life and claims every item. The first is
+   * the job; the rest get a save path of their own and are cancelled.
+   *
+   * `savePath` is the assertion that matters, twice over:
+   *
+   * - it must not be EMPTY — an item with no save path is the dialog, and it is what the old
+   *   code left behind;
+   * - it must not be `<id>.part` — Chromium deletes the file of an item it cancelled, and that
+   *   file is the adopted item's live download. `FakeItem.cancel` really unlinks, so an engine
+   *   that pointed the second item at our partial would take the bytes with it and the
+   *   completion below could not happen.
+   */
+  it('keeps the first item and discards the second onto a path of its own', async () => {
+    const id = 'twoitems-1';
+    const part = join(dir, `${id}.part`);
+    let first: FakeItem | null = null;
+    let second: FakeItem | null = null;
+
+    const { rec, rig, store: own } = await runRecipeDownload(id, {
+      stepMs: 30_000, // if the steps ran on, this test would take half a minute
+      totalMs: 60_000,
+      seedDoc: (r, rig) => {
+        r.doc.els.push(el('button', {
+          text: 'Download',
+          onClick: () => {
+            setTimeout(() => {
+              // One item, adopted, with Chromium writing into the save path it was given.
+              first = rig.startItemFromPage();
+              writeFileSync(part, BODY);
+              // And a second one from the same window, moments later.
+              second = rig.startItemFromPage();
+              // Only then does the kept download finish, so the discard happened while our
+              // partial was on disk with bytes in it.
+              setTimeout(() => { first!.finish('completed'); }, 10).unref?.();
+            }, 20).unref?.();
+          },
+        }));
+      },
+    });
+
+    // The engine's own idea of the path, so this test cannot pass by asserting the wrong file.
+    expect(own.partPath(id)).toBe(part);
+
+    expect(first!.savePath).toBe(part);
+    expect(first!.cancelled, 'the adopted item was cancelled').toBe(0);
+
+    // Claimed: it was given a save path, which is the whole difference between a download and
+    // a modal dialog on a window nobody can see.
+    expect(second!.savePath, 'the second item reached the session unclaimed').not.toBe('');
+    // But NOT ours, because cancelling deletes it.
+    expect(second!.savePath, 'the second item was pointed at the adopted item\u2019s live file')
+      .not.toBe(part);
+    expect(second!.cancelled, 'the second item was left running').toBe(1);
+
+    // The kept download completed on its own bytes, which is the proof the discard did not
+    // take them: `done` here means the engine found, hashed and renamed the file.
+    expect(rec!.state).toBe('done');
+    expect(rec!.sha256).toBe(SHA);
+    expect(rec!.size).toBe(BODY.length);
+    expect(rig.asked, 'a URL was fetched even though an item had already arrived').toEqual([]);
+
+    // One file in the directory and it is the finished one: the throwaway path was cleaned up
+    // with the item it belonged to.
+    expect((await readdir(dir)).filter((f) => f.startsWith(id)).sort()).toEqual([`${id}.bin`]);
+  }, 20_000);
+});
+
+describe('a page whose main document fails after the download began', () => {
+  const BODY = Buffer.from('bytes that arrived before the document gave up');
+  const SHA = createHash('sha256').update(BODY).digest('hex');
+
+  /**
+   * A download can be adopted DURING the load — the `duringLoad` fixture in the integration
+   * suite is exactly that — and a page is free to fail its own main document afterwards, by
+   * navigating away from itself or by simply being served badly. `loadURL` then rejects with
+   * the item already ours and its bytes already arriving.
+   *
+   * Reporting that as `recipe-failed` would be two wrongs at once: the verdict says the site's
+   * markup broke when in truth the file is on its way, and the item's `done` still renames the
+   * completed file into place — against a settled, failed record, where nothing will ever read
+   * it and only the retention sweep will remove it.
+   *
+   * So the adopted item is checked FIRST here, exactly as it is after the steps.
+   */
+  it('completes on the item rather than blaming the recipe', async () => {
+    const id = 'loadfail-1';
+    const part = join(dir, `${id}.part`);
+
+    const { rec, rig } = await runRecipeDownload(id, {
+      // A download that begins as part of the document's own load, and a document that then
+      // fails. Chromium rejects `loadURL` for both reasons; the item is unaffected by either.
+      loadURL: async (rig) => {
+        const dl = rig.startItemFromPage();
+        writeFileSync(part, BODY);
+        setTimeout(() => { dl.finish('completed'); }, 20).unref?.();
+        throw new Error('ERR_ABORTED (-3) loading \u2018http://host.test/page\u2019');
+      },
+      seedDoc: revealing('http://host.test/file.bin'),
+    });
+
+    expect(rec!.error, 'the record was failed while its bytes were still arriving').toBeUndefined();
+    expect(rec!.state).toBe('done');
+    expect(rec!.sha256).toBe(SHA);
+    // No step ever ran and no URL was derived: the item was the whole job.
+    expect(rig.asked).toEqual([]);
+    expect(rig.renderer.replies).toEqual([]);
+    // And the finished file is the record's, not an orphan beside a failed one.
+    expect((await readdir(dir)).filter((f) => f.startsWith(id)).sort()).toEqual([`${id}.bin`]);
+  }, 20_000);
+});
+
+describe('a recipe that derives an enormous value', () => {
+  /**
+   * An `href` has no length limit — a `data:` URI holding an image is ordinary markup — and
+   * every rejection on this path QUOTES what it refused. That message is written into the
+   * record, into the manifest that is rewritten on every progress tick, and served back out of
+   * `/gh/jobs/:id`. So the size is checked before anything parses or echoes the value.
+   */
+  it('refuses it by length, without quoting it into the record', async () => {
+    // Unparseable as well as enormous — an unterminated IPv6 host throws out of `new URL`
+    // with or without a base — because that is the path that used to embed it: the value
+    // reaches `validateTarget`, fails to parse, and the rejection quotes what it read.
+    const huge = `http://[${'a'.repeat(9_000)}`;
+    const { rec, rig } = await runRecipeDownload('huge-1', { seedDoc: revealing(huge) });
+
+    expect(rec!.state).toBe('failed');
+    expect(rec!.error!.code).toBe('recipe-failed');
+    expect(rec!.error!.message).toMatch(/9008 characters/);
+    // The value itself is nowhere in the record, at any length.
+    expect(rec!.error!.message).not.toContain('aaaaaaaaaa');
+    expect(rec!.error!.message.length).toBeLessThan(300);
+    expect(rig.asked).toEqual([]);
   });
 });

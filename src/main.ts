@@ -109,6 +109,17 @@ async function start(): Promise<void> {
   // Resolved from `import.meta.url`, once, so the path is the same whatever launched the app.
   const recipePreload = recipePreloadPath();
 
+  /**
+   * `ipcMain` is process-wide and every in-flight recipe step holds one listener on the single
+   * result channel, so the ceiling is the download concurrency — which goes to 16. Node warns
+   * at 10 listeners on one emitter and calls it a probable leak, which here it is not: the
+   * listeners are added and removed one per step by `browserDownload`, and the two-window test
+   * in `test/unit/recipe-bridge.test.ts` is what holds them apart. Raised once, at wiring,
+   * rather than per download, and above the cap rather than at it so the warning still means
+   * something if a step ever stops removing its own listener.
+   */
+  ipcMain.setMaxListeners(cfg.downloadConcurrency * 2 + 10);
+
   const downloads = new JobQueue<string, void>({
     concurrency: cfg.downloadConcurrency,
     idgen: () => randomUUID(),
@@ -119,7 +130,7 @@ async function start(): Promise<void> {
       // floor and the record would sit queued until the process restarted.
       const ac = aborts.get(id) ?? new AbortController();
       aborts.set(id, ac);
-      const stopWatchdog = watchForStall(id, ac);
+      const watchdog = watchForStall(id, ac);
       const recipe = recipes.get(id);
       try {
         await browserDownload(id, {
@@ -155,6 +166,9 @@ async function start(): Promise<void> {
           }),
           noStartMs: cfg.downloadNoStartMs,
           stallMs: cfg.downloadStallMs,
+          // The transfer has begun, so the idle window starts here rather than behind a page
+          // load and a recipe's whole budget. See `watchForStall`.
+          onItemAdopted: () => watchdog.restart(),
           ...(recipe
             ? {
                 recipe: {
@@ -168,7 +182,7 @@ async function start(): Promise<void> {
             : {}),
         }, ac.signal);
       } finally {
-        stopWatchdog();
+        watchdog.stop();
         aborts.delete(id);
         // On EVERY path, settled or cancelled: the map is the only thing holding this recipe.
         recipes.delete(id);
@@ -178,6 +192,12 @@ async function start(): Promise<void> {
       }
     },
   });
+
+  /** The stall watchdog's handle: stopped when the job ends, restarted when its transfer begins. */
+  interface StallWatch {
+    stop(): void;
+    restart(): void;
+  }
 
   /**
    * The idle watchdog. A host that accepts the socket and then goes quiet mid-body produces no
@@ -209,6 +229,18 @@ async function start(): Promise<void> {
    * move 4MB on a slow link -- 120s is; see the note on the range in `config.ts` before anyone
    * tightens it.
    *
+   * What it does NOT do is measure the phases in front of the transfer. Its clock is seeded
+   * unconditionally, so it starts before the window exists — and on a recipe that means it is
+   * already running through the page load and every step. At the defaults those add up to the
+   * whole window on their own (`GATEHOUSE_RECIPE_TOTAL_MS` 60s plus
+   * `GATEHOUSE_DOWNLOAD_NO_START_MS` 60s is `GATEHOUSE_DOWNLOAD_STALL_MS` 120s exactly), so a
+   * recipe that legitimately spent its budget would hand a just-started transfer a window of
+   * nothing and settle it as one that "stopped advancing". `restart()` below is what stops
+   * that: `browserDownload` calls it the moment it adopts an item, so the idle window is
+   * measured over the transfer it describes. The unconditional seeding stays, because the case
+   * with no item at all — a host that accepts the socket and says nothing — still needs a
+   * bound, and it is the one the ordering note above and `download.test.ts` both rest on.
+   *
    * Aborting is ALL this does. `browserDownload` notices the signal, cancels the item and
    * settles from its `done`, so the single terminal-state writer stays where it is, per the
    * invariant in `downloads/record.ts`.
@@ -225,7 +257,7 @@ async function start(): Promise<void> {
    * nothing on disk. Mid-transfer resilience comes from Chromium's own retry of a dropped
    * ranged transfer instead; ours is the restart path in `requeueInterrupted`.
    */
-  function watchForStall(id: string, ac: AbortController): () => void {
+  function watchForStall(id: string, ac: AbortController): StallWatch {
     let lastReceived = store.get(id)?.received ?? 0;
     let lastProgressAt = Date.now();
     // A quarter of the window, so the abort lands within 1.25x of it rather than 2x. The floor
@@ -250,7 +282,13 @@ async function start(): Promise<void> {
     // The download holds the process up on its own; an interval that outlived it would be a
     // leak on a daemon that runs for weeks, and would abort a later job sharing the id.
     timer.unref?.();
-    return () => clearInterval(timer);
+    return {
+      stop: () => clearInterval(timer),
+      restart: () => {
+        lastReceived = store.get(id)?.received ?? 0;
+        lastProgressAt = Date.now();
+      },
+    };
   }
 
   /** The one place that hands an id to the download queue: `/gh/fetch` and the resume below. */

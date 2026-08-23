@@ -32,6 +32,16 @@ export interface GatehouseConfig {
    * stopped advancing instead — true, but less specific. No relationship is enforced because
    * the inversion is genuinely useful: it is how a test reaches the watchdog without sitting
    * through a 60s request phase.
+   *
+   * **A recipe puts a third budget in front of both**, and at the defaults the three meet
+   * exactly: `recipeTotalMs` (60s) + this (60s) = `downloadStallMs` (120s), to the millisecond.
+   * That arithmetic used to matter, because the idle watchdog's clock started when the job did
+   * and therefore ran through the page load and every step — a recipe that legitimately spent
+   * its budget handed the transfer a window of nothing and could settle as one that "stopped
+   * advancing". It no longer does: the watchdog is restarted the moment an item is adopted
+   * (`BrowserDownloadDeps.onItemAdopted`), so the stall window is measured over the transfer
+   * and the three budgets no longer have to be reasoned about together. The pair above is
+   * still an ordering question, and still unconstrained.
    */
   downloadNoStartMs: number;
   /** How long a completed download's bytes survive without being released. */

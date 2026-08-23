@@ -26,8 +26,9 @@ cookie is presented. That fixture proves the *mechanism* (a real browser clears 
 interstitial, the cookie is captured, the wire shape matches). It cannot prove the
 *premise*, because real Cloudflare fingerprints far more than the fixture does.
 
-So: treat "works against real Cloudflare" as unverified. The remaining acceptance is
-a manual run against a real client and a real protected host.
+So: **on the strength of the suite alone**, treat "works against real Cloudflare" as
+unverified — that acceptance is a manual run against a real client and a real protected
+host, and the live-verification sections below are where those runs are recorded.
 
 ## Requirements
 
@@ -286,6 +287,15 @@ one job while it is open, whatever their steps say.
 is downloaded. But a `click` is free to start the download itself, and when it does, that item
 *is* the result: the remaining steps are abandoned and the job completes on the bytes, with no
 `readAttribute` having produced anything.
+
+**A page that starts several downloads gets one job, not several.** The first item the recipe's
+window produces is the job's file; every later one is claimed and cancelled, and the job settles
+on the first. That is not tidiness — an item the app does not claim is Chromium's to dispose of,
+and measured on Electron 43.4.1 / Windows 11 it writes the whole file into the operator's own
+Downloads folder under a UUID `.tmp` name, with no record anywhere, no retention and no bound.
+(The behaviour documented for other platforms is a native modal Save As dialog, which on a
+hidden window in a daemon never resolves at all.) If a site's page genuinely offers two
+different files, a recipe cannot express that: `POST` two jobs.
 
 **The URL a recipe derives is hostile input.** It came off a page, so it goes through the same
 scheme gate every caller URL passes: a derived `file:///C:/Windows/win.ini` is refused, named,
@@ -598,13 +608,23 @@ clicked — is what `recipe` is for.
 **What is not proven about recipes.** The whole feature runs end to end in
 `test/integration/recipe.test.ts` against a local fixture that mimics the measured flow — a
 button that reveals a link after a moment, a button that starts the download itself, one that
-reveals a `file:` URL, and one that reveals nothing at all — through the real spawned app, the
-real preload and a real hidden window. That proves the *mechanism*: the click, the poll, the
-attribute read, both legitimate endings, the scheme gate on the derived URL, and the step
-timeout as a bound rather than a hope. **It says nothing about any real site.** No recipe has
-been run against a live host, and the fixture's markup is a reconstruction of one site's flow,
-not that site. A recipe is a selector contract the site never agreed to; treat "works against
-the real thing" as unverified until a live run says otherwise.
+reveals a `file:` URL, one that reveals nothing at all, one whose download starts during the
+page load, and one that starts a second download nobody asked for — through the real spawned
+app, the real preload and a real hidden window. That proves the *mechanism*: the click, the
+poll, the attribute read, both legitimate endings, the scheme gate on the derived URL, the
+handler ordering, the extra item that must be claimed and discarded, and the step timeout as a
+bound rather than a hope.
+
+One real site has been added to that: the run in the live-verification table above fetched a
+real file through a real recipe. **What that is worth is exactly what it says — one site, on
+one day, against that site's markup as it stood.** It is not a claim about recipes in general.
+Nothing here has been run against any other host, so no other site's markup is known to be
+reachable by these three verbs; and the site that was measured is under no obligation to keep
+the `wire:click` handler, the anchor or the attribute the recipe names. A recipe is a selector
+contract the site never agreed to, so a working one can stop working on any deploy, with no
+warning and no error until a job fails. What the design does about that is make the failure
+cheap and legible rather than prevent it: a broken recipe settles `recipe-failed` inside
+`GATEHOUSE_RECIPE_STEP_MS`/`GATEHOUSE_RECIPE_TOTAL_MS`, naming the step and its selector.
 
 ## Test
 

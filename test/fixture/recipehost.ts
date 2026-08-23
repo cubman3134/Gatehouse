@@ -9,7 +9,7 @@ import type { AddressInfo, Socket } from 'node:net';
  * plain `POST /gh/fetch` of the page URL against this host downloads the *page*; only driving
  * it gets the file.
  *
- * The modes are the four endings the engine has to tell apart:
+ * The modes are the endings — and the hazards — the engine has to tell apart:
  *
  * - `reveal`  — the measured flow. The click reveals `<a href="/file.bin">` after a delay, and
  *               the recipe reads its `href`.
@@ -23,17 +23,28 @@ import type { AddressInfo, Socket } from 'node:net';
  * - `duringLoad` — the download starts **while the page is still loading**, with no click at
  *               all. This is the only mode that lands before `loadURL` resolves, which is what
  *               makes it the one that can see the handler-ordering rule. See below.
+ * - `twice`   — a page that starts a download and then starts **another one**. One item is the
+ *               job; the second has no owner, and an item nobody claims is Chromium's to
+ *               dispose of — measured, straight into the user's Downloads folder. See below.
  *
  * The delay is deliberate rather than incidental: a link that appears synchronously inside the
  * click would let a `waitFor` that never polls pass anyway.
  */
-export type RecipeHostMode = 'reveal' | 'direct' | 'hostile' | 'never' | 'duringLoad';
+export type RecipeHostMode = 'reveal' | 'direct' | 'hostile' | 'never' | 'duringLoad' | 'twice';
 
 export interface RecipeHost {
   /** The page a recipe starts at. */
   url: string;
   /** The file the page leads to, for an independent fetch or a negative assertion. */
   fileUrl: string;
+  /**
+   * How many times the file itself has been requested.
+   *
+   * The `twice` mode's whole premise is that the page really does start a second download, and
+   * a test asserting "the second item was discarded" would pass just as happily against a page
+   * that only ever started one. This is what stops that.
+   */
+  fileRequests(): number;
   close(): Promise<void>;
 }
 
@@ -93,6 +104,43 @@ function page(mode: RecipeHostMode, revealMs: number): string {
 </body></html>`;
   }
 
+  /**
+   * `twice`: one download during the load, and a SECOND one a moment later.
+   *
+   * Nothing about a page limits it to one download. Two iframes, a click handler bound twice, a
+   * script that loops `location.href` — all ordinary, all producing more than one item on the
+   * session. Only one of them can be this job's file; the rest reach the session with no
+   * listener willing to claim them, get no save path, and Chromium then does whatever its own
+   * default download routine says. Measured on Electron 43.4.1 / Windows 11 26200 that is: the
+   * whole file, silently, into the user's own Downloads folder under a UUID `.tmp` name — no
+   * record, no retention, no bound. The documented alternative on other platforms is the native
+   * modal Save As dialog, which on a hidden window in a daemon never resolves at all.
+   *
+   * **Both iframes are in the markup, and that is a timing decision rather than a stylistic
+   * one.** The items still arrive strictly one after another — a session emits `will-download`
+   * on one thread — so the second one lands with the first already adopted, which is precisely
+   * the state the old handler could not survive: it removed itself on adoption, leaving every
+   * later item unowned. Starting the second download from a `setTimeout` would read more like
+   * "later", but it races the job's own lifetime: half a megabyte over loopback finishes in
+   * milliseconds and the window is destroyed on settle, so a delayed second request can arrive
+   * to find nothing left to serve it and the test would prove nothing at all.
+   *
+   * The two requests are for the same bytes under different query strings, because the fixture
+   * routes on the path alone. Same bytes on purpose: whichever item the engine keeps, the hash
+   * assertion is about the file being the FILE and not the page, and the test does not have to
+   * depend on which of two concurrent requests Chromium turns into an item first.
+   */
+  if (mode === 'twice') {
+    return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>recipe fixture (twice)</title></head>
+<body>
+  <p id="slot"></p>
+  <button id="go">Download</button>
+  <iframe src="/file.bin?first" hidden></iframe>
+  <iframe src="/file.bin?second" hidden></iframe>
+</body></html>`;
+  }
+
   const reveal = (href: string): string =>
     `setTimeout(function () {
        var a = document.createElement('a');
@@ -130,9 +178,11 @@ export async function startRecipeHost(opts: RecipeHostOptions = {}): Promise<Rec
   const revealMs = opts.revealMs ?? 300;
   const html = Buffer.from(page(mode, revealMs), 'utf8');
 
+  let fileRequests = 0;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const path = (req.url ?? '/').split('?')[0];
     if (path === '/file.bin') {
+      fileRequests += 1;
       res.writeHead(200, {
         'content-type': 'application/octet-stream',
         // What makes `direct`'s navigation a download rather than a render.
@@ -164,6 +214,7 @@ export async function startRecipeHost(opts: RecipeHostOptions = {}): Promise<Rec
   return {
     url: `${origin}/page`,
     fileUrl: `${origin}/file.bin`,
+    fileRequests: () => fileRequests,
     close: () => new Promise<void>((r) => {
       server.close(() => r());
       for (const s of sockets) s.destroy();

@@ -43,6 +43,19 @@ export const PROGRESS_BYTES = 4 * 1024 * 1024;
 const BRIDGE_GRACE_MS = 500;
 
 /**
+ * The longest attribute value a recipe may derive and still have it treated as a URL.
+ *
+ * Chosen against what actually exists rather than against a spec: no HTTP stack in wide use
+ * accepts a request line past about 8KB (IIS and nginx both stop around there), and browsers
+ * themselves cap a navigable URL near 32KB, so 8192 is comfortably past every download link a
+ * site could legitimately mint and comfortably short of a `data:` URI holding an image. What it
+ * bounds is not the fetch — `validateTarget` refuses anything but http(s) anyway — but the
+ * ERROR MESSAGE: a rejection quotes what it refused, and that string is persisted into the
+ * manifest and served back from `/gh/jobs/:id`.
+ */
+const MAX_DERIVED_URL = 8192;
+
+/**
  * The main-process half of the recipe bridge — `ipcMain`, structurally.
  *
  * Injected rather than imported for the reason the whole module keeps `import type` from
@@ -87,6 +100,20 @@ export interface BrowserDownloadDeps {
   noStartMs: number;
   /** How long `receivedBytes` may sit still before the transfer is judged stalled. */
   stallMs: number;
+  /**
+   * Called once, at the moment a download item is adopted — the transfer has begun.
+   *
+   * It exists for the idle watchdog outside this module, whose clock would otherwise span
+   * everything that happened FIRST: the window, the page load, and on a recipe every step. At
+   * the defaults those add up exactly — `recipeTotalMs` (60s) plus `noStartMs` (60s) is
+   * `stallMs` (120s) to the millisecond — so a recipe that legitimately took its time would
+   * race the watchdog and could settle `network`/"stopped advancing" about a transfer that had
+   * only just started. Restarting the clock here makes the stall window measure what its
+   * message describes: an item that exists and has stopped moving.
+   *
+   * Optional: the callers that do not run a watchdog (every unit test) pass nothing.
+   */
+  onItemAdopted?: () => void;
   /** Present only when this job's URL has to be derived by driving a page first. */
   recipe?: RecipeRun;
 }
@@ -157,11 +184,16 @@ async function hashFile(path: string): Promise<string> {
  * **A recipe puts a page in front of all of that, and its ordering is load-bearing.** The window
  * is created with the bridge preload, `will-download` is attached **before anything navigates**,
  * and only then does the window load `startUrl` and the steps run. Attaching that handler later
- * is not a smaller version of the same thing: an item nobody claims makes Chromium open a native
- * modal Save As dialog that never resolves — measured, and fatal on a daemon — and a `click`
- * step is entirely free to start a download itself. Which is also the second legitimate way a
+ * is not a smaller version of the same thing: an item nobody claims is Chromium's to dispose of
+ * as it sees fit, and neither of the two things it then does is acceptable — the documented one
+ * is a native modal Save As dialog that never resolves, fatal on a daemon; the one MEASURED here
+ * (Electron 43.4.1, Windows 11 26200) is quieter and in one way worse, the whole file written
+ * into the user's own Downloads folder under a UUID `.tmp` name, outside the store, outside
+ * retention and reported nowhere. See the handler itself for the measurement. A `click` step is
+ * entirely free to start a download itself, too — which is also the second legitimate way a
  * recipe ends: if an item arrives mid-recipe it **is** the result, the remaining steps are
- * abandoned, and no `readAttribute` needs to have produced anything.
+ * abandoned, and no `readAttribute` needs to have produced anything. And a page may start MORE
+ * than one, which is why the handler claims every item rather than only its first.
  *
  * The URL a recipe derives is hostile input and goes through `validateTarget` here, on the way
  * out. `runRecipe` returns it deliberately unvalidated so that gate cannot be skipped by
@@ -401,6 +433,9 @@ export async function browserDownload(
       /** Wire an item we have decided is ours, and settle from its `done`. */
       const adopt = (dl: DownloadItem): void => {
         item = dl;
+        // The transfer has begun: whatever bounded the phases before it is done, and the idle
+        // watchdog's window should start from here rather than from the job's submission.
+        deps.onItemAdopted?.();
         // The recipe's second legitimate ending: a `click` started the download itself, so this
         // item IS the result and the remaining steps are pointless. Abandoning the step in
         // flight is what makes that immediate instead of one step timeout later.
@@ -595,22 +630,64 @@ export async function browserDownload(
           return;
         }
 
+        /**
+         * How many items past the first this window has produced. Only ever used to make the
+         * throwaway save path below unique, so two discarded items cannot name one file.
+         */
+        let extras = 0;
+
         const onWillDownload = (_e: Event, dl: DownloadItem, from: WebContents): void => {
           // The ONLY reliable correlation on this path. `from` is `null` for any resume in
           // flight, and another job's window for any sibling, so both fall out here.
           if (from !== ownWebContents) return;
-          // MUST be synchronous. With no save path Chromium opens a native modal Save As dialog
-          // and the download never completes — fatal for a daemon. Measured: synchronous, a
-          // microtask and `setTimeout(0)` all work; `setTimeout(300)` is silently ignored and
-          // hangs. So this comes first, even in the give-up case below, where it is what stops
-          // a late arrival raising a dialog nobody will ever click.
-          dl.setSavePath(part);
-          if (settled) {
-            // The no-start timer already gave up on this download; do not resurrect the record.
+
+          /**
+           * EVERY item this window produces is claimed, not just the first, and the listener
+           * therefore stays attached for the window's whole life.
+           *
+           * A page is free to start more than one download: two iframes, a click handler that
+           * fires twice, a document that loops `location.href`. A recipe puts exactly such a
+           * page on this path, which increment 2b never did. Detaching after the first item —
+           * which is what this used to do — leaves every later one unclaimed, because a sibling
+           * job's listener sees the wrong `webContents` and returns above. Nothing then calls
+           * `setSavePath`, and Chromium falls back to its own default download routine.
+           *
+           * **What that fallback actually does was measured, and it is not what this code was
+           * written expecting.** The design says an unclaimed item raises the native modal Save
+           * As dialog and wedges the process. On Electron 43.4.1 / Windows 11 26200 it does not:
+           * with the fix reverted and a page starting two downloads, the job completed normally
+           * and the second item was written **in full into the user's own Downloads folder**,
+           * under a UUID `.tmp` name. Silent, outside the store, invisible to retention and to
+           * `/gh/jobs/:id`, and unbounded — one such file per extra item, forever, on a daemon.
+           * Bad in a quieter way than a hang, and worse in one respect: nothing reports it.
+           *
+           * The modal is not therefore hypothetical — it is documented Electron behaviour and
+           * depends on the platform's download prefs — so both hazards are designed out by the
+           * same rule, and neither is relied on: give EVERY item a save path (synchronously —
+           * measured, a `setTimeout(300)` is already too late), then keep the first and cancel
+           * the rest.
+           */
+          if (item || settled) {
+            /**
+             * NOT `part`. Chromium DELETES the file of an item it cancelled, and `part` is the
+             * adopted item's live, still-being-written file — pointing a doomed item at it
+             * would delete the download we are keeping. A path of its own is a path Chromium
+             * may delete freely.
+             *
+             * `settled` with no item reaches here too (the no-start timer gave up, and a late
+             * arrival must not resurrect the record); it takes the same throwaway path rather
+             * than a second rule, because "an item we are not keeping never names our file" is
+             * the property worth having in one piece.
+             */
+            extras += 1;
+            dl.setSavePath(`${part}.extra-${extras}`);
             dl.cancel();
+            log.warn('discarded an extra download item from this window', {
+              id, extras, adopted: item !== null,
+            });
             return;
           }
-          ses.removeListener('will-download', onWillDownload);
+          dl.setSavePath(part);
           adopt(dl);
           recordHeaders(dl);
         };
@@ -753,6 +830,13 @@ export async function browserDownload(
             try {
               await wc.loadURL(run.recipe.startUrl);
             } catch (e: unknown) {
+              // ENDING TWO AGAIN, and it is checked FIRST here for the same reason it is after
+              // the steps: a download can be adopted DURING the load — the `duringLoad` fixture
+              // is exactly that — and a page is free to fail its main document afterwards on
+              // purpose. Failing the record then would settle `recipe-failed` while the bytes
+              // are still arriving, and the completed file would be renamed into place against
+              // a failed record: the wrong verdict plus an orphaned `.bin`.
+              if (item) return;
               // Chromium rejects with ERR_NAME_NOT_RESOLVED and friends. The page never came
               // up, so no step could have run — say that rather than blaming a selector.
               if (!settled) {
@@ -788,6 +872,24 @@ export async function browserDownload(
              * inherit http(s) from a page we navigated to. Everything still goes through
              * `validateTarget` either way.
              */
+            /**
+             * The length gate, BEFORE anything parses or echoes the value.
+             *
+             * An attribute is whatever the site put in it, and `href` has no length limit —
+             * a `data:` URI holding a multi-megabyte image is ordinary markup. Every rejection
+             * below quotes the value it refused, and that message goes into the record, into
+             * the manifest that is rewritten on every progress tick, and back out of
+             * `/gh/jobs/:id`. So a value too long to be a URL we would fetch is refused by its
+             * SIZE and never quoted, rather than being carried through the system verbatim.
+             */
+            if (derived.url.length > MAX_DERIVED_URL) {
+              failRecipe(
+                `the recipe derived a value of ${derived.url.length} characters, which is past ` +
+                  `the ${MAX_DERIVED_URL} a URL we would fetch can be; it is not quoted here`,
+              );
+              return;
+            }
+
             const base = wc.getURL() || run.recipe.startUrl;
             let absolute = derived.url;
             try { absolute = new URL(derived.url, base).href; } catch { /* validateTarget names it */ }

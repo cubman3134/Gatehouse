@@ -79,6 +79,39 @@ const settle = async (base: string, id: string, ms = 60_000): Promise<JobBody> =
   }
 };
 
+/**
+ * Poll to a settled state under a deadline of this test file's own, per request as well as
+ * overall — because the failure the unclaimed-item tests guard against is a **hang**.
+ *
+ * An item nobody claims makes Chromium open a native modal Save As dialog on a hidden window,
+ * and a main process sitting behind one stops answering HTTP altogether. So every request here
+ * carries its own timeout and a failure to answer is reported as what it is, rather than being
+ * left to surface as vitest's own timeout with no explanation attached.
+ */
+const boundedSettle = async (base: string, id: string, ms: number): Promise<JobBody> => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    let body: JobBody;
+    try {
+      const res = await fetch(`${base}/gh/jobs/${id}`, { signal: AbortSignal.timeout(5_000) });
+      body = (await res.json()) as JobBody;
+    } catch (e: unknown) {
+      // A main process wedged behind a modal dialog stops answering. Name that, rather than
+      // letting it read as a network blip.
+      throw new Error(
+        `polling job ${id} failed after ${ms - (deadline - Date.now())}ms — the app stopped ` +
+          `answering, which is what an unclaimed download item looks like: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    if (SETTLED.includes(body.state)) return body;
+    if (Date.now() > deadline) {
+      throw new Error(`job ${id} never settled within ${ms}ms; last state ${body.state}`);
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+};
+
 beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), 'gh-recipe-'));
   gh = await startGatehouse({ GATEHOUSE_DOWNLOADS_DIR: dir });
@@ -182,34 +215,10 @@ describe('a download that starts while the page is still loading', () => {
    * this goes red: the item is missed, no `a#link` ever appears, and the job fails
    * `recipe-failed` on the `waitFor` step deadline instead of completing on the bytes.
    *
-   * Everything below is bounded by a deadline of this test's own, per request as well as
-   * overall, because the failure this guards against is a *hang*: if an unclaimed item ever did
-   * block the main process, the poll must fail as our timeout rather than as vitest's.
+   * It polls through `boundedSettle`, because the failure this guards against is a *hang*: if
+   * an unclaimed item ever did block the main process, the poll must fail as our timeout rather
+   * than as vitest's.
    */
-  const boundedSettle = async (base: string, id: string, ms: number): Promise<JobBody> => {
-    const deadline = Date.now() + ms;
-    for (;;) {
-      let body: JobBody;
-      try {
-        const res = await fetch(`${base}/gh/jobs/${id}`, { signal: AbortSignal.timeout(5_000) });
-        body = (await res.json()) as JobBody;
-      } catch (e: unknown) {
-        // A main process wedged behind a modal dialog stops answering. Name that, rather than
-        // letting it read as a network blip.
-        throw new Error(
-          `polling job ${id} failed after ${ms - (deadline - Date.now())}ms — the app stopped ` +
-            `answering, which is what an unclaimed download item looks like: ` +
-            `${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-      if (SETTLED.includes(body.state)) return body;
-      if (Date.now() > deadline) {
-        throw new Error(`job ${id} never settled within ${ms}ms; last state ${body.state}`);
-      }
-      await new Promise((r) => setTimeout(r, 150));
-    }
-  };
-
   it('claims the item even though nothing clicked, and completes on its bytes', async () => {
     const host = await startRecipeHost({ mode: 'duringLoad', body: BODY, filename: 'duringload.bin' });
     const started = Date.now();
@@ -314,4 +323,100 @@ describe('a recipe whose step never matches', () => {
       await rm(neverDir, { recursive: true, force: true });
     }
   }, 150_000);
+});
+
+describe('a page that starts a second download', () => {
+  /**
+   * **The regression net for the fatal one.**
+   *
+   * `will-download` fires on the SESSION, and a page may start as many downloads as it likes.
+   * The handler used to remove itself the moment it adopted its item, which meant every later
+   * item from the same window reached the session with nobody willing to claim it: a sibling
+   * job's handler rejects it on `webContents`, so nothing calls `setSavePath`, and the item
+   * becomes Chromium's to dispose of. What it actually does with it was measured, and it is not
+   * the modal the design predicted — see the assertion on the app's log below, which is the only
+   * one here that can tell the two builds apart.
+   *
+   * Increment 2b never had this exposure, because no page ran on the plain download path.
+   * Recipes created it, so the proof belongs here.
+   *
+   * The engine now keeps the listener attached for the window's whole life and claims every
+   * item, keeping the first and cancelling the rest onto a throwaway save path. The throwaway
+   * matters as much as the claim: Chromium DELETES the file of an item it cancelled, so
+   * pointing a doomed item at `<id>.part` — the adopted item's live file — would delete the
+   * download being kept. The directory assertion below is what holds both halves.
+   */
+  it('completes on the first item, discards the second, and keeps answering', async () => {
+    const host = await startRecipeHost({ mode: 'twice', body: BODY, filename: 'twice.bin' });
+    try {
+      const id = await fetchRecipe(gh.url, host.url, 'twice');
+      const done = await boundedSettle(gh.url, id, 45_000);
+
+      expect(done.error, 'the job failed instead of completing on its first item').toBeUndefined();
+      expect(done.state).toBe('done');
+      // The page and the file are served from one origin, so a job that downloaded the *page*
+      // would settle `done` just as happily. The hash is what says it got the file.
+      expect(done.result!.sha256).toBe(SHA);
+      expect(done.result!.size).toBe(BODY.length);
+      expect((await stat(done.result!.path)).size).toBe(BODY.length);
+
+      // The fixture really did start two downloads. Without this the test would pass just as
+      // happily against a page that only ever started one, which is to say against nothing.
+      expect(host.fileRequests(), 'the page did not start a second download').toBeGreaterThanOrEqual(2);
+
+      /**
+       * **And the ENGINE saw the second one**, which is the assertion the rest of this test
+       * cannot make.
+       *
+       * What Chromium does with an item nobody claims turns out not to be the modal the design
+       * predicted — measured on Electron 43.4.1 / Windows 11, it falls through to the browser's
+       * default download routine and writes the whole file into the user's own Downloads folder
+       * under a UUID `.tmp` name. Silent, outside the store, invisible to retention, and it
+       * grows without bound on a daemon. The job still completes, so every HTTP-level assertion
+       * above passes with the handler detaching on adoption exactly as it does without.
+       *
+       * The log line is the difference. It is written on the claim-and-cancel branch and
+       * nowhere else, so it says the item reached a handler that wanted it, rather than
+       * reaching the session with nobody left to answer for it.
+       */
+      const discarded = `"id":"${id}","extras":1`;
+      const deadline = Date.now() + 5_000;
+      // The pipe is asynchronous: the line is written before the job settles, but the chunk
+      // carrying it may not have crossed yet.
+      while (!gh.output().includes(discarded) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(gh.output(), 'the engine never claimed the second item; Chromium was left to ' +
+        'decide what to do with it, which is a file in the user’s Downloads folder')
+        .toContain(discarded);
+
+      /**
+       * Exactly one file, and it is the finished one.
+       *
+       * This is the assertion about the throwaway path. A discarded item saved to `<id>.part`
+       * and then cancelled would have deleted the adopted item's bytes — the job would fail to
+       * finalise rather than leave a file. And a throwaway that Chromium did NOT clean up would
+       * show here as an `<id>.part.extra-1` left behind.
+       */
+      expect(await readdir(dir).then((f) => f.filter((n) => n.startsWith(id)).sort()))
+        .toEqual([`${id}.bin`]);
+
+      /**
+       * And the process is still there.
+       *
+       * The measured disposal is silent, but the documented one — a native modal on the hidden
+       * window — is not, and a main process behind one answers nothing at all. This request is
+       * bounded and issued after both downloads have been served, so it is the direct statement
+       * that no dialog was raised on this platform either. `DELETE` rather than a read, so it
+       * has to reach the store and act.
+       */
+      const del = await fetch(`${gh.url}/gh/jobs/${id}`, {
+        method: 'DELETE',
+        signal: AbortSignal.timeout(5_000),
+      });
+      expect(del.status, 'the app stopped answering after the second item').toBe(204);
+    } finally {
+      await host.close();
+    }
+  }, 120_000);
 });
