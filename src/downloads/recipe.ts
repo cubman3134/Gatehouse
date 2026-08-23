@@ -125,6 +125,12 @@ export function validateRecipe(raw: unknown): Recipe | RecipeError {
  * holds its symbol alone: a channel name that drifts fails *silently*. The sender sends into a
  * channel nobody listens on, the step never answers, and every recipe dies of the step timeout
  * with a message that describes the page rather than the wiring.
+ *
+ * The mint is single only on this side. `src/preload/recipe.cjs` is hand-written CommonJS,
+ * outside the TypeScript program and unable to import this module, so it restates these two
+ * values literally. `test/unit/preload.test.ts` reads that file and asserts the two agree —
+ * the guard that stands in for the single mint the preload cannot have. Change a value here
+ * and change it there.
  */
 export const STEP_CHANNEL = 'gatehouse:recipe-step';
 export const RESULT_CHANNEL = 'gatehouse:recipe-result';
@@ -141,8 +147,15 @@ export interface RecipeDeps {
    * budget *between* steps and nothing at all *during* one: a `send` that never settles hangs
    * the recipe past every deadline here, forever, holding its job slot. That is not
    * hypothetical — a preload that fails to load produces exactly it, and this was measured
-   * doing so. The IPC wiring races the reply against the deadline and resolves
-   * `{ ok: false }` when the timer wins.
+   * doing so.
+   *
+   * So the implementation MUST race the IPC reply against `deadlineMs` and resolve
+   * `{ ok: false, error: … }` when the timer wins, rather than waiting on a reply that may
+   * never come. `runRecipe` cannot do this for it and does not try: there is no timer here to
+   * cancel a `Promise` this module did not create. Nor may the loser of that race be left to
+   * reject later into nothing — a reply arriving after the timeout is dropped, not thrown.
+   * The unit tests below settle `send` themselves, so nothing in this file can catch a
+   * `send` that forgets; only the wiring's own test can.
    */
   send: (step: RecipeStep, deadlineMs: number) => Promise<StepResult>;
   stepMs: number;
