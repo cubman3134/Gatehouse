@@ -457,6 +457,25 @@ you took the local `path` and have not copied or moved the file yet, it can vani
 or `DELETE` it when you are done, or raise the TTL. An unsettled record is never swept, at
 any age or size.
 
+### Live verification, 2026-08-23: recipes work against the site that forced them
+
+romhackplaza mints its download URL from a Livewire click and binds it to the session that
+minted it, so no "derive elsewhere, fetch here" split can reach it. Run through the real app:
+
+| step | result |
+|---|---|
+| `/v1` regression | `ok`, `cf_clearance` present |
+| recipe via `POST /gh/fetch` | **`done`** — 2,215 bytes, `Battletoads -  Extended.zip` |
+| the file | a real ZIP (`PK`), valid archive, 4 entries — not an error page |
+| `sha256` | hashed independently from the file on disk, matches the reported digest |
+| `GET /gh/files/:id` | 200, byte-identical to disk |
+| `Range: bytes=100-199` | 206, `content-range: bytes 100-199/2215`, byte-equal slice |
+| `DELETE /gh/jobs/:id` | 204, then 404, and the file gone from disk |
+
+That byte count is the same one a hand-driven browser probe produced downloading in the session
+that opened the modal — which is the evidence the derive-and-fetch-in-one-session premise
+actually holds, rather than merely being the design.
+
 ### Live verification, 2026-08-23: `/gh/fetch` works end to end
 
 Re-run against the same real Cloudflare-protected file that the previous engine could not
