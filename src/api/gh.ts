@@ -10,7 +10,7 @@ export interface GhDeps {
   store: DownloadStore;
   /** Hand the id to the download queue. */
   submit: (id: string) => void;
-  /** Abort an in-flight transfer. */
+  /** Abort an in-flight download. */
   cancel: (id: string) => void;
   now: () => number;
 }
@@ -153,11 +153,11 @@ async function postFetch(req: IncomingMessage, res: ServerResponse, deps: GhDeps
   const open = deps.store.findOpen(target.session, target.url);
   if (open) { sendJson(res, 202, { jobId: open.id, state: open.state }); return; }
 
-  // The one caller-supplied field we hand to a THIRD party: `transfer` sends it as an outbound
+  // The one caller-supplied field we hand to a THIRD party: the engine sends it as an outbound
   // `Referer`. Node's own validator would throw rather than let a CRLF split the request, but
   // that throw is a fault we would rather not manufacture — and the value is persisted into a
   // manifest that is rewritten in full on every progress tick, so an oversized one is
-  // amplified across the whole transfer. Accept only a plain http(s) URL.
+  // amplified across the whole download. Accept only a plain http(s) URL.
   let referer: string | null = null;
   if (typeof body.referer === 'string' && body.referer !== '') {
     let parsedReferer: URL | null = null;
@@ -169,29 +169,21 @@ async function postFetch(req: IncomingMessage, res: ServerResponse, deps: GhDeps
     referer = parsedReferer.href;
   }
 
-  // Nothing is open for this target, but something may be RESUMABLE: a record that settled
-  // `failed` with a transient code and whose `.part` is still on disk. Take it over — same id,
-  // back to `queued`, straight onto the queue — so the caller's retry after a mid-body drop
-  // continues from the bytes we already have instead of pulling a 40GB file again from zero.
-  // Without this the partial `transfer` deliberately keeps has no reader outside a restart.
+  // Nothing open for this target, so this is a NEW record with a new id — there is deliberately
+  // no reclaim of a settled `failed` one.
   //
-  // AFTER the referer check, so a malformed referer is still a 400 rather than being silently
-  // ignored; the reclaimed record keeps the referer it was created with, since it is resuming
-  // that same fetch. `store.findResumable` is what decides what may be reclaimed and why —
-  // notably not a cancel and not a permanent failure. `findOpen` above still runs first, so a
-  // target already being worked on is never reclaimed out from under its own transfer.
-  const resumable = await deps.store.findResumable(target.session, target.url);
-  if (resumable) {
-    // Unsettled BEFORE the submit, exactly as `requeueInterrupted` does it: that is what makes
-    // `findOpen` fold the next request onto this job. The stale `error` and `completedAt` go
-    // with it, or `/gh/jobs/<id>` would report a queued job that also carries a failure.
-    await deps.store.update(resumable.id, { state: 'queued', error: undefined, completedAt: null });
-    log.info('resuming a failed download in place of a new one', { id: resumable.id, received: resumable.received });
-    deps.submit(resumable.id);
-    sendJson(res, 202, { jobId: resumable.id, state: 'queued' });
-    return;
-  }
-
+  // There used to be. It existed so a 40GB download would not restart from zero after a blip,
+  // and under the byte-stream transfer that was real. Under the browser engine it has no
+  // reachable trigger: a stall ends in `item.cancel()` and Chromium deletes the partial of an
+  // item it cancelled; a natural mid-body interrupt never fires `done` at all, so it only ever
+  // reaches us through that same stall path; and a 404 settles with 0 bytes and no file. The
+  // one shape that did still match was pathological — a download that completed but could not
+  // be hashed or renamed, whose COMPLETE `.part` then resumed at `offset === size`, took a 416,
+  // interrupted, and went round again. A loop was the only reachable path through it.
+  //
+  // Mid-transfer resilience now comes from Chromium's own retry of a dropped ranged transfer.
+  // Across a restart it comes from `requeueInterrupted`, which is a different mechanism and
+  // still proven.
   const rec = await deps.store.create({ url: target.url, session: target.session, referer });
   deps.submit(rec.id);
   sendJson(res, 202, { jobId: rec.id, state: rec.state });
@@ -224,9 +216,10 @@ async function deleteJob(res: ServerResponse, id: string, deps: GhDeps): Promise
   if (!rec) { sendError(res, 404, 'not-found', `no such job: ${id}`); return; }
 
   if (!isSettled(rec.state)) {
-    // Cancelling is asynchronous: the transfer notices the abort, closes its stream, deletes
-    // its partial, and only then marks the record cancelled. Removing the record here would
-    // race that writer — see the settle-after-close invariant in `downloads/record.ts`.
+    // Cancelling is asynchronous: the engine notices the abort, cancels the browser's item,
+    // and only marks the record cancelled once Chromium has released the file. Removing the
+    // record here would race that writer — see the settle-after-close invariant in
+    // `downloads/record.ts`.
     deps.cancel(id);
   } else {
     await deps.store.remove(id);

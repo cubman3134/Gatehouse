@@ -36,9 +36,9 @@ const ID = /^[A-Za-z0-9_-]+$/;
 export const INTERRUPTED_BY_RESTART = 'interrupted by a restart';
 
 /**
- * Durable home for download records. The queue that schedules a transfer is ephemeral and its
+ * Durable home for download records. The queue that schedules a download is ephemeral and its
  * jobs are pruned on settle; THIS is what `/gh/jobs/:id` reads, which is why a caller can poll
- * — and fetch the bytes — long after the transfer finished.
+ * — and fetch the bytes — long after the download finished.
  */
 export class DownloadStore {
   private readonly records = new Map<string, DownloadRecord>();
@@ -48,11 +48,11 @@ export class DownloadStore {
 
   get dir(): string { return this.opts.dir; }
 
-  /** The store's clock. `transfer` stamps completion times with it so a test's injected
-   *  clock governs those too, rather than transfer reaching for `Date.now()` of its own. */
+  /** The store's clock. The download engine stamps completion times with it so a test's
+   *  injected clock governs those too, rather than the engine reaching for `Date.now()`. */
   nowMs(): number { return this.opts.now(); }
 
-  /** `<id>.part` while transferring, `<id>.bin` once complete. Never a remote-supplied name. */
+  /** `<id>.part` while downloading, `<id>.bin` once complete. Never a remote-supplied name. */
   partPath(id: string): string {
     if (!ID.test(id)) throw new Error(`invalid id: ${id}`);
     return join(this.opts.dir, `${id}.part`);
@@ -83,7 +83,7 @@ export class DownloadStore {
           continue;
         }
         if (r && typeof r.id === 'string') {
-          // Nothing can be mid-transfer across a restart: the process that owned it is gone.
+          // Nothing can be mid-download across a restart: the process that owned it is gone.
           // Demote so a stale `running` cannot block dedupe or survive a sweep forever.
           this.records.set(r.id, isSettled(r.state) ? r : { ...r, state: 'failed', error: { code: 'cancelled', message: INTERRUPTED_BY_RESTART }, completedAt: this.opts.now() });
         }
@@ -103,45 +103,6 @@ export class DownloadStore {
   findOpen(session: string, url: string): DownloadRecord | undefined {
     for (const r of this.records.values()) {
       if (!isSettled(r.state) && r.session === session && r.url === url) return r;
-    }
-    return undefined;
-  }
-
-  /**
-   * A settled-`failed` record for this exact target that a fresh request may TAKE OVER instead
-   * of minting a new id — or undefined, which means "start a new download".
-   *
-   * Without this, `transfer`'s promise that a failure keeps its partial is one the system
-   * cannot keep. `findOpen` refuses a settled record, so a re-POST after a mid-body drop mints
-   * a new id and a new `.part`, the kept bytes are orphaned disk until the sweep, and a 40GB
-   * download restarts from zero after a blip. The only other caller of the resume path is
-   * `requeueInterrupted`, which fires once at startup and by design refuses real failures.
-   *
-   * All four conditions matter:
-   *
-   *   - `failed`, never `cancelled`. The caller asked for a cancel and its partial is already
-   *     gone; folding a later request onto that record would resurrect something it retired.
-   *   - code `network`, never `http-error` or `disk-full`. Those are permanent as far as we can
-   *     tell — a 404, a refused 206, a full disk — and a retry just hits the same wall. This is
-   *     also what excludes `load()`'s restart demotion, which carries `cancelled`: that one is
-   *     `requeueInterrupted`'s to handle, at startup, and it is not this path's business.
-   *   - the `.part` must still exist and be non-empty, or there is nothing to resume FROM and
-   *     the reclaim buys nothing over a fresh id.
-   *   - same session and same url, because that is what makes it the same download.
-   *
-   * The newest candidate wins, so a target that failed repeatedly resumes from the furthest
-   * partial rather than an older, shorter one. The caller must set the record back to `queued`
-   * before it yields: an unsettled record is what makes `findOpen` fold the *next* request onto
-   * this same job rather than reclaiming it a second time.
-   */
-  async findResumable(session: string, url: string): Promise<DownloadRecord | undefined> {
-    const candidates = [...this.records.values()]
-      .filter((r) => r.state === 'failed' && r.session === session && r.url === url && r.error?.code === 'network')
-      .sort((a, b) => (b.completedAt ?? b.createdAt) - (a.completedAt ?? a.createdAt));
-    for (const r of candidates) {
-      try {
-        if ((await stat(this.partPath(r.id))).size > 0) return r;
-      } catch { /* no partial: nothing to resume from */ }
     }
     return undefined;
   }
@@ -258,7 +219,7 @@ export class DownloadStore {
   /**
    * Atomic: write a sibling tmp then rename over the manifest, so a crash mid-write leaves the
    * previous manifest intact rather than a truncated one. Serialised through `writing` because
-   * concurrent transfers update progress from several places at once. Persistence is best-effort;
+   * concurrent downloads update progress from several places at once. Persistence is best-effort;
    * a write failure is logged but does not stop the daemon, degrading the store to in-memory only.
    */
   private save(): Promise<void> {

@@ -294,6 +294,49 @@ throttled and can lag."
   - `function browserDownload(id: string, deps: BrowserDownloadDeps, signal: AbortSignal): Promise<void>`
   - `const STALLED: unique symbol` — re-exported so the watchdog and the settle path agree, as `transfer.ts` did
 
+> **Amended before implementation — the resume path needs its OWN correlation, measured.**
+>
+> The code below funnels both paths through one `will-download` handler keyed on the
+> `webContents` argument. That is correct for `downloadURL` and **wrong for a resume.** Measured
+> (10/10 across two runs):
+>
+> - `createInterruptedDownload` **does** fire `will-download` — **synchronously, inside the call
+>   itself**; the handler runs and returns before the call returns.
+> - Its third argument is **`null`**, never a `webContents`. This is structural, not incidental:
+>   `createInterruptedDownload` is declared only on `Session`, while `downloadURL` exists on
+>   `Session`, `WebContents` and `WebviewTag`. There is no window-scoped resume API, so the
+>   argument has nothing to be. It was `null` even with two hidden windows live.
+> - `setSavePath` is **not** needed on the resume path — the `path` option stands on its own, no
+>   Save As dialog appears, and `item.getSavePath()` is **already populated** inside the handler
+>   (on the `downloadURL` path it is `""`).
+> - Concurrent resumes ARE distinguishable, by `getSavePath()` and by `getReceivedBytes()`.
+>
+> **So the module needs two correlation mechanisms, not one:**
+>
+> | path | started by | correlate on |
+> |---|---|---|
+> | fresh | `win.webContents.downloadURL(url)` | the handler's `webContents === win.webContents` |
+> | resume | `ses.createInterruptedDownload({path, ...})` | a one-shot `ses.once('will-download', ...)` armed **immediately before** the call |
+>
+> Because the resume emission is synchronous, arming a `once` listener directly before the call
+> captures that call's own item even when interleaved with others. **There must be no `await`
+> between arming and calling** — that is the whole guarantee.
+>
+> Keep `item.getSavePath() === part` as an assertion on the resume path. The synchronous
+> emission is not documented by Electron; it reproduced 10/10 and follows from the item being
+> constructed locally, but a cheap tripwire beats relying on undocumented ordering.
+>
+> **A resume needs no window at all** — do not create one for it.
+>
+> **Store invariant to state and rely on:** two live records must never share a `path`, or their
+> resume items are indistinguishable, one never settles, and the file ends up 0 bytes. Ours are
+> `<id>.part` with `randomUUID` ids, so this holds by construction — say so in a comment rather
+> than leaving it to luck.
+>
+> One more measured consequence for the fresh path: a resumed item is **born in state
+> `interrupted` and does nothing until `resume()` is called on it.** The handler must call
+> `item.resume()`.
+
 - [ ] **Step 1: Implement `src/downloads/browser.ts`**
 
 ```ts

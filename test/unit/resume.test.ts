@@ -13,8 +13,9 @@ import type { JobError } from '../../src/jobs/queue.js';
  * `main.ts` is not an option: it imports `electron` at the top level and registers an
  * `app.on` handler on load, so a unit test of it would need a real browser process.
  *
- * What this covers is the gap the review found: `transfer` can resume from a `<id>.part`, and
- * that is well tested, but before this nothing ever called it a second time for the same id.
+ * What this covers is the gap the review found: the download engine can resume from a
+ * `<id>.part`, and that decision is well tested, but before this nothing ever called the engine
+ * a second time for the same id.
  */
 
 let dir: string;

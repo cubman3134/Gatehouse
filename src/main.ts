@@ -1,4 +1,4 @@
-import { app, net, session as electronSession } from 'electron';
+import { app, BrowserWindow, session as electronSession } from 'electron';
 import { loadConfig } from './config.js';
 import { BrowserPool } from './browser/pool.js';
 import { makeSolver } from './browser/solve.js';
@@ -9,7 +9,8 @@ import type { GhDeps } from './api/gh.js';
 import { DownloadStore } from './downloads/store.js';
 import { requeueInterrupted } from './downloads/resume.js';
 import { isSettled } from './downloads/record.js';
-import { transfer, STALLED, type Requester, type TransferResponse } from './downloads/transfer.js';
+import { browserDownload } from './downloads/browser.js';
+import { STALLED } from './downloads/stalled.js';
 import { log } from './log.js';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -30,72 +31,6 @@ const WILDCARD_LOOPBACK: Record<string, string> = { '0.0.0.0': '127.0.0.1', '::'
  * something on a box where nobody downloads anything for a week.
  */
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
-
-/**
- * A `Requester` over Electron's `net`, issued on a named partition.
- *
- * This is the point of the whole increment. `net.request` with a `session` AND
- * `useSessionCookies` sends the bytes down the same partition that solved the challenge, so
- * they carry that partition's cookies
- * and Chromium's TLS/HTTP2 fingerprint — not Node's. A host that hands a `cf_clearance`
- * holder a file and hands Node a challenge page cannot tell this apart from the browser it
- * already let through, because it *is* that browser's network stack.
- *
- * `transfer` tests the same seam through `nodeRequester`; keeping both behind one narrow
- * interface is what lets the download logic be tested without an Electron.
- */
-export function electronRequester(): Requester {
-  return (req, signal) =>
-    new Promise<TransferResponse>((resolve, reject) => {
-      // A signal that has already fired never calls its listener, so an early cancel has to be
-      // caught before anything is registered or it is not caught at all.
-      if (signal.aborted) { reject(new Error('cancelled before the request was issued')); return; }
-
-      const request = net.request({
-        url: req.url,
-        session: electronSession.fromPartition(`persist:${req.session}`),
-        // REQUIRED, and not the default. Electron's `net.request` sends NO cookies from the
-        // session unless this is set (`useSessionCookies` defaults to false) — passing
-        // `session` alone buys the partition's network stack but not its cookie jar. Without
-        // it every download of a challenge-protected file gets a 403, which is exactly what
-        // live verification found: the whole point of routing downloads through the browser
-        // is the `cf_clearance` this carries.
-        useSessionCookies: true,
-      });
-      for (const [k, v] of Object.entries(req.headers)) request.setHeader(k, v);
-
-      let answered = false;
-      // Without this, a host that accepts the socket and then says nothing holds this promise
-      // open forever: the transfer only wires the signal to the *response*, so during the
-      // request phase nothing else is listening. That leaves an unsettled promise and a
-      // `running` record no sweep may reclaim. Rejecting is what `transfer` expects — it maps
-      // a rejection with an aborted signal onto `cancelled`, not onto a network fault.
-      const onAbort = (): void => {
-        request.abort();
-        if (!answered) reject(new Error('cancelled before the response arrived'));
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
-
-      request.on('response', (res) => {
-        answered = true;
-        signal.removeEventListener('abort', onAbort);
-        const flat: Record<string, string> = {};
-        for (const [k, v] of Object.entries(res.headers)) {
-          flat[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : String(v ?? '');
-        }
-        resolve({
-          status: res.statusCode,
-          headers: flat,
-          body: res as unknown as AsyncIterable<Uint8Array>,
-          abort: () => request.abort(),
-        });
-      });
-      // Once the response is in the caller's hands a socket fault surfaces on the body stream
-      // instead, and this promise is already settled — guard rather than leave it to chance.
-      request.on('error', (e: Error) => { if (!answered) reject(e); });
-      request.end();
-    });
-}
 
 async function start(): Promise<void> {
   const cfg = loadConfig(process.env);
@@ -155,7 +90,6 @@ async function start(): Promise<void> {
   await store.load();
 
   const aborts = new Map<string, AbortController>();
-  const request = electronRequester();
 
   const downloads = new JobQueue<string, void>({
     concurrency: cfg.downloadConcurrency,
@@ -169,41 +103,87 @@ async function start(): Promise<void> {
       aborts.set(id, ac);
       const stopWatchdog = watchForStall(id, ac);
       try {
-        await transfer(id, store, request, ac.signal);
+        await browserDownload(id, {
+          store,
+          // The partition that solved the challenge. Its cookies AND its network stack come
+          // with it, which is the entire point: `net.request` on this same partition is
+          // refused 403 by a fingerprinting host even holding a valid clearance, and only the
+          // browser's own download stack gets the bytes. See the README's live-verification
+          // table before reintroducing anything that fetches by hand.
+          partitionFor: (name) => electronSession.fromPartition(`persist:${name}`),
+          // ONE HIDDEN WINDOW PER JOB, and it is not a style choice. `will-download` fires on
+          // the session, and for two concurrent downloads of the same URL every field on the
+          // item is identical while fire order does not match call order — the `webContents`
+          // argument is the only discriminator there is. A shared window makes the two jobs
+          // indistinguishable. `test/integration/browser-download.test.ts` downloads the same
+          // URL twice at once as the regression net for exactly that.
+          makeWindow: (name) => new BrowserWindow({
+            show: false,
+            webPreferences: {
+              partition: `persist:${name}`,
+              contextIsolation: true,
+              nodeIntegration: false,
+              sandbox: true,
+            },
+          }),
+          noStartMs: cfg.downloadNoStartMs,
+          stallMs: cfg.downloadStallMs,
+        }, ac.signal);
       } finally {
         stopWatchdog();
         aborts.delete(id);
-        // Retention is enforced after every transfer, not on a timer: the thing that grows the
-        // directory is a transfer finishing, so that is when the cap needs testing.
+        // Retention is enforced after every download, not on a timer: the thing that grows the
+        // directory is a download finishing, so that is when the cap needs testing.
         await store.sweep();
       }
     },
   });
 
   /**
-   * The idle watchdog. A host that accepts the socket and then writes NOTHING produces no
-   * response and no error, so nothing inside the transfer ever fires: it holds a concurrency
-   * slot until the process restarts, and with the default of two slots, two such hosts wedge
-   * the whole download surface while `/gh/fetch` keeps handing out 202s that never run. A
-   * caller DELETE is the only other thing that can free it, and a caller with no timeout of
-   * its own never sends one.
+   * The idle watchdog. A host that accepts the socket and then goes quiet mid-body produces no
+   * error and no `done` — measured, an interrupted item sat that way past 300s — so it holds a
+   * concurrency slot until the process restarts, and with the default of two slots two such
+   * hosts wedge the whole download surface while `/gh/fetch` keeps handing out 202s that never
+   * run. A caller DELETE is the only other thing that can free it, and a caller with no timeout
+   * of its own never sends one.
    *
-   * IDLE, not total: the clock is reset by progress, so a legitimate multi-GB transfer may run
-   * for hours. It fires only when `received` has not moved for a whole window. `transfer`
+   * It overlaps `browserDownload`'s own no-start timer without duplicating it. That one bounds
+   * the REQUEST phase, where there is no item at all; this one bounds an item that exists and
+   * has stopped moving. Both are needed, and each names the fault it measures.
+   *
+   * WHICH of the two names a given fault is an ordering question, though, and the config does
+   * not settle it. This watchdog seeds its clock unconditionally, so it does not need an item
+   * to fire: a host that accepts the socket and never writes a status line is inside BOTH
+   * windows at once, and whichever elapses first is the one that reports it. With the defaults
+   * (60s no-start, 120s stall) that is the no-start timer, which is the tighter bound and the
+   * more precise description. Configure `GATEHOUSE_DOWNLOAD_STALL_MS` below
+   * `GATEHOUSE_DOWNLOAD_NO_START_MS` — which is allowed, and which
+   * `test/integration/download.test.ts` does deliberately, to reach this watchdog in a bounded
+   * test — and a request-phase hang is reported here instead, as a download that stopped
+   * advancing. Not wrong (it never advanced), but less specific than the timer that would have
+   * said "nothing ever began". See the note on the pair in `config.ts`.
+   *
+   * IDLE, not total: the clock is reset by progress, so a legitimate multi-GB download may run
+   * for hours. It fires only when `received` has not moved for a whole window. The engine
    * persists `received` every 4MB, so the window must stay comfortably larger than the time to
    * move 4MB on a slow link -- 120s is; see the note on the range in `config.ts` before anyone
    * tightens it.
    *
-   * Aborting is ALL this does. `transfer` notices the signal, closes its stream and only then
-   * settles the record, so the single terminal-state writer stays where it is, per the
+   * Aborting is ALL this does. `browserDownload` notices the signal, cancels the item and
+   * settles from its `done`, so the single terminal-state writer stays where it is, per the
    * invariant in `downloads/record.ts`.
    *
    * The abort carries a REASON, though, and that is what stops it lying to the caller. Aborting
-   * bare would land on the transfer's cancel path: the partial deleted and the record settled
-   * `cancelled` — a 40GB download binned at 95% because the host went quiet, reported with a
-   * code that reads as the caller's own doing. Passing `STALLED` lets `transfer` tell the two
-   * apart on `signal.reason` and settle a stall as `failed`/`network` with its partial kept, so
-   * a re-POST resumes it. Still one settle site; only the reason crosses.
+   * bare would land on the cancel path and settle `cancelled` — a 40GB download binned at 95%
+   * because the host went quiet, reported with a code that reads as the caller's own doing.
+   * Passing `STALLED` lets the engine tell the two apart on `signal.reason` and settle a stall
+   * as the retryable host fault it is, `failed`/`network`. Still one settle site; only the
+   * reason crosses.
+   *
+   * What it does NOT buy is kept bytes. Ending a stalled browser download means `item.cancel()`
+   * and Chromium deletes the partial of an item it cancelled, so a stalled record settles with
+   * nothing on disk. Mid-transfer resilience comes from Chromium's own retry of a dropped
+   * ranged transfer instead; ours is the restart path in `requeueInterrupted`.
    */
   function watchForStall(id: string, ac: AbortController): () => void {
     let lastReceived = store.get(id)?.received ?? 0;
@@ -213,7 +193,7 @@ async function start(): Promise<void> {
     const tick = Math.max(250, Math.floor(cfg.downloadStallMs / 4));
     const timer = setInterval(() => {
       const rec = store.get(id);
-      // Gone, or already settled by the transfer itself: there is nothing left to abort.
+      // Gone, or already settled by the engine itself: there is nothing left to abort.
       if (!rec || isSettled(rec.state)) { clearInterval(timer); return; }
       if (rec.received !== lastReceived) {
         lastReceived = rec.received;
@@ -227,7 +207,7 @@ async function start(): Promise<void> {
       });
       ac.abort(STALLED);
     }, tick);
-    // The transfer holds the process up on its own; an interval that outlived it would be a
+    // The download holds the process up on its own; an interval that outlived it would be a
     // leak on a daemon that runs for weeks, and would abort a later job sharing the id.
     timer.unref?.();
     return () => clearInterval(timer);
@@ -249,7 +229,7 @@ async function start(): Promise<void> {
   //      That is a safe default, but on its own it strands an interrupted download: `failed`
   //      is settled, so `findOpen` will not return it, a re-POST mints a new id and a new
   //      `.part`, and the bytes already on disk are orphaned until the TTL sweep. Nothing
-  //      re-submits it -- which would leave `transfer`'s resume path with no caller at all.
+  //      re-submits it -- which would leave the engine's resume path with no caller at all.
   //      Put the ones that still have a partial back on the queue under their ORIGINAL ids, so
   //      a consumer polling `/gh/jobs/<id>` across a restart sees it resume rather than a dead
   //      `failed`.
@@ -260,7 +240,7 @@ async function start(): Promise<void> {
   await requeueInterrupted(store, submitDownload);
   await store.sweep();
 
-  // Startup and after-every-transfer are both event-driven, and between them they miss the one
+  // Startup and after-every-download are both event-driven, and between them they miss the one
   // case the TTL is actually a promise about: a daemon that goes quiet. Nothing finishes, so
   // nothing sweeps, and expired bytes sit on disk until the next download — which on an idle
   // box may be never. `unref` so this can never be the reason the process stays alive, and it
@@ -279,8 +259,9 @@ async function start(): Promise<void> {
     // `submit` returns a job record; nothing here awaits it, and the queue captures a failing
     // `run` itself, so no rejection escapes into this void-ed call site.
     submit: submitDownload,
-    // Fire-and-forget by design. The transfer notices the abort, closes its stream, drops its
-    // partial and only then marks the record cancelled — settling here would race that writer.
+    // Fire-and-forget by design. The engine notices the abort, cancels the browser's item and
+    // only settles the record once Chromium has released the file — settling here would race
+    // that writer.
     cancel: (id) => { aborts.get(id)?.abort(); },
     now: () => Date.now(),
   };
@@ -298,7 +279,19 @@ async function start(): Promise<void> {
   // `http://0.0.0.0:8191` connects nowhere useful. Advertise the loopback the wildcard covers.
   const host = WILDCARD_LOOPBACK[cfg.bind] ?? cfg.bind;
   process.stdout.write(`GATEHOUSE_READY http://${host}:${server.port}\n`);
-  app.on('before-quit', () => { clearInterval(sweepTimer); pool.destroy(); void server.close(); });
+  app.on('before-quit', () => {
+    clearInterval(sweepTimer);
+    pool.destroy();
+    // `void`ed, so the `catch` is not optional. `close()` rejects with ERR_SERVER_NOT_RUNNING
+    // if anything already closed the listener — a second quit signal, or a listen that never
+    // came up — and on the way out of the process an unhandled rejection is the last thing an
+    // operator needs in the log. There is nothing to do about it but say so.
+    void server.close().catch((e: unknown) => {
+      log.warn('the HTTP server did not close cleanly', {
+        message: e instanceof Error ? e.message : String(e),
+      });
+    });
+  });
 }
 
 // Startup runs entirely inside the guard. loadConfig, the pool and the solver used to sit
