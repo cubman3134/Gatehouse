@@ -1,21 +1,29 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DownloadStore } from '../../src/downloads/store.js';
 import { handleGh, type GhDeps } from '../../src/api/gh.js';
+import type { Recipe } from '../../src/downloads/recipe.js';
 
 let dir: string; let server: Server; let base: string; let store: DownloadStore;
 let submitted: string[]; let cancelled: string[]; let n = 0; let clock = 1000;
+/** What was handed to the queue BESIDE each id — the recipe never touches the record. */
+let handedRecipes: Array<Recipe | undefined>;
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'gh-api-')); n = 0; clock = 1000;
-  submitted = []; cancelled = [];
+  submitted = []; cancelled = []; handedRecipes = [];
   store = new DownloadStore({ dir, now: () => clock, idgen: () => `d${++n}`, ttlMs: 1e9, maxBytes: 1e12 });
   await store.load();
-  const deps: GhDeps = { store, submit: (id) => submitted.push(id), cancel: (id) => cancelled.push(id), now: () => clock };
+  const deps: GhDeps = {
+    store,
+    submit: (id, recipe) => { submitted.push(id); handedRecipes.push(recipe); },
+    cancel: (id) => cancelled.push(id),
+    now: () => clock,
+  };
   server = createServer((req, res) => {
     void (async () => {
       const path = (req.url ?? '/').split('?')[0]!;
@@ -148,6 +156,134 @@ describe('POST /gh/fetch', () => {
     expect(answer.status).toBe(400);
     expect((JSON.parse(answer.text) as any).error.code).toBe('bad-request');
     expect(submitted).toEqual([]);
+  });
+});
+
+describe('POST /gh/fetch with a recipe', () => {
+  const START = 'http://example.test/page';
+  const steps = [
+    { op: 'click', selector: 'button#go', text: 'Download' },
+    { op: 'waitFor', selector: 'a#link' },
+    { op: 'readAttribute', selector: 'a#link', attribute: 'href' },
+  ];
+  const body = (over: Record<string, unknown> = {}) => ({ recipe: { startUrl: START, steps }, ...over });
+
+  const message = async (res: Response): Promise<string> => ((await res.json()) as any).error.message;
+
+  /**
+   * `url` and `recipe` are alternatives, not a preference order. A body carrying both is a
+   * caller that believes one of the two is doing something, and half of that belief is wrong —
+   * picking one silently would download the right bytes for the wrong reason on a good day and
+   * the whole page on a bad one.
+   */
+  it('refuses a body carrying both url and recipe', async () => {
+    const res = await post(body({ url: 'http://example.test/f.bin' }));
+    expect(res.status).toBe(400);
+    expect(await message(res)).toMatch(/exactly one of url or recipe/);
+    expect(submitted).toEqual([]);
+  });
+
+  it('refuses a body carrying neither', async () => {
+    const res = await post({ site: 'example.test' });
+    expect(res.status).toBe(400);
+    expect(await message(res)).toMatch(/exactly one of url or recipe/);
+    expect(submitted).toEqual([]);
+  });
+
+  // The browser navigates to `startUrl` itself and sends whatever Referer that implies. A
+  // caller-supplied one would be either ignored or contradicted; both are worse than saying so.
+  it('refuses a referer alongside a recipe', async () => {
+    const res = await post(body({ referer: 'https://example.test/' }));
+    expect(res.status).toBe(400);
+    expect(await message(res)).toMatch(/referer is not accepted with a recipe/);
+    expect(submitted).toEqual([]);
+  });
+
+  // The whole point of the validator's messages: a recipe breaks when a site changes its
+  // markup, and "step 2" is the difference between one log line and an afternoon.
+  it('refuses an invalid recipe with a message naming the step', async () => {
+    const res = await post({
+      recipe: { startUrl: START, steps: [{ op: 'click', selector: 'button' }, { op: 'sudo', selector: 'x' }] },
+    });
+    expect(res.status).toBe(400);
+    const said = await message(res);
+    expect(said).toMatch(/step 1/);
+    expect(said).toMatch(/unknown op/);
+    expect(submitted).toEqual([]);
+  });
+
+  // `validateRecipe` puts `startUrl` through the same gate every other URL passes.
+  it('refuses a file: startUrl', async () => {
+    const res = await post({ recipe: { startUrl: 'file:///C:/secrets.txt', steps } });
+    expect(res.status).toBe(400);
+    expect(await message(res)).toMatch(/scheme/);
+    expect(submitted).toEqual([]);
+  });
+
+  // `validateRecipe` cannot see `site` — the partition name is decided in the handler, so the
+  // gate runs again there and a hostile one is still refused.
+  it('refuses a hostile site alongside a valid recipe', async () => {
+    const res = await post(body({ site: '../../etc' }));
+    expect(res.status).toBe(400);
+    expect(submitted).toEqual([]);
+  });
+
+  it('accepts a valid recipe, records its startUrl, and hands the steps to the queue in memory', async () => {
+    const res = await post(body({ site: 'example.test' }));
+    expect(res.status).toBe(202);
+    expect(((await res.json()) as any).jobId).toBe('d1');
+    expect(submitted).toEqual(['d1']);
+
+    // The record's url is the START URL, which is what keeps dedupe, the logs and
+    // `/gh/jobs/:id` working unchanged.
+    const rec = store.get('d1')!;
+    expect(rec.url).toBe(START);
+    expect(rec.session).toBe('example.test');
+    expect(rec.referer).toBeNull();
+    // The one bit about the recipe that IS persisted: enough to stop a restart mistaking the
+    // page for the file, and nothing more.
+    expect(rec.viaRecipe).toBe(true);
+
+    // The steps travelled BESIDE the record, not on it.
+    expect(handedRecipes[0]).toBeDefined();
+    expect(handedRecipes[0]!.startUrl).toBe(START);
+    expect(handedRecipes[0]!.steps).toHaveLength(3);
+    expect((rec as unknown as Record<string, unknown>).recipe).toBeUndefined();
+  });
+
+  /**
+   * A recipe is a caller's contract with a site's MARKUP. The manifest is rewritten on every
+   * progress tick and read by an operator; selectors have no business in it, and this is the
+   * assertion that keeps them out — of the record and of the file it is written to.
+   */
+  it('keeps the selectors out of the manifest entirely', async () => {
+    await post(body());
+    const manifest = await readFile(join(dir, 'manifest.json'), 'utf8');
+    expect(manifest).toContain('d1');
+    expect(manifest).not.toContain('button#go');
+    expect(manifest).not.toContain('readAttribute');
+    expect(manifest).not.toContain('steps');
+  });
+
+  it('dedupes two recipe fetches for the same startUrl and site onto one job', async () => {
+    const first = await post(body({ site: 'example.test' }));
+    const again = await post(body({ site: 'example.test' }));
+    expect(((await first.json()) as any).jobId).toBe('d1');
+    expect(((await again.json()) as any).jobId).toBe('d1');
+    expect(again.status).toBe(202);
+    expect(submitted).toEqual(['d1']); // scheduled once, not twice
+  });
+
+  // Different steps against the same page are still the same target: the record is keyed on
+  // session+url, and the second caller is handed the first job. Documented, not accidental.
+  it('folds a differently-stepped recipe for the same page onto the open job', async () => {
+    await post(body({ site: 'example.test' }));
+    const again = await post({
+      site: 'example.test',
+      recipe: { startUrl: START, steps: [{ op: 'readAttribute', selector: 'a', attribute: 'href' }] },
+    });
+    expect(((await again.json()) as any).jobId).toBe('d1');
+    expect(submitted).toEqual(['d1']);
   });
 });
 

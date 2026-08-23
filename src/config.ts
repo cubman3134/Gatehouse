@@ -38,6 +38,24 @@ export interface GatehouseConfig {
   downloadTtlMs: number;
   /** Cap on the downloads directory; least-recently-accessed completed files evict first. */
   downloadMaxBytes: number;
+  /**
+   * How long one recipe step may wait for its element before the step fails.
+   *
+   * A *step* budget, not a recipe one: it is handed down to the page, which polls to it, and
+   * the main process races the same deadline so a bridge that never answers cannot hang the
+   * job. A site that reveals its link after an animation needs seconds, not milliseconds; a
+   * selector that will never match should not cost a minute.
+   */
+  recipeStepMs: number;
+  /**
+   * Ceiling on a whole recipe, across all its steps.
+   *
+   * Twelve steps at the default step budget would otherwise be three minutes of held download
+   * slot for a page that has silently changed its markup. The smaller of the two budgets is
+   * what a step is actually given, so a late step cannot spend a full step timeout past the
+   * end of this one.
+   */
+  recipeTotalMs: number;
 }
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -109,5 +127,13 @@ export function loadConfig(env: Record<string, string | undefined>): GatehouseCo
       env.GATEHOUSE_DOWNLOAD_MAX_BYTES, 50 * 1024 * 1024 * 1024, 'GATEHOUSE_DOWNLOAD_MAX_BYTES',
       1024 * 1024, Number.MAX_SAFE_INTEGER,
     ),
+    // 15s. Long enough for a page that reveals its link behind a short animation or a
+    // round-trip to the site's own backend; short enough that a selector a redesign broke
+    // costs one of these per step rather than a minute.
+    recipeStepMs: intFrom(env.GATEHOUSE_RECIPE_STEP_MS, 15_000, 'GATEHOUSE_RECIPE_STEP_MS', 1_000, 120_000),
+    // 60s across every step. Deliberately NOT constrained against the step budget: the engine
+    // hands a step the smaller of the two remaining budgets, so a total below a step's is
+    // simply a tighter recipe, which is how a test reaches this bound without waiting.
+    recipeTotalMs: intFrom(env.GATEHOUSE_RECIPE_TOTAL_MS, 60_000, 'GATEHOUSE_RECIPE_TOTAL_MS', 5_000, 600_000),
   };
 }

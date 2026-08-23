@@ -1,4 +1,4 @@
-import { app, BrowserWindow, session as electronSession } from 'electron';
+import { app, BrowserWindow, ipcMain, session as electronSession } from 'electron';
 import { loadConfig } from './config.js';
 import { BrowserPool } from './browser/pool.js';
 import { makeSolver } from './browser/solve.js';
@@ -11,6 +11,8 @@ import { requeueInterrupted } from './downloads/resume.js';
 import { isSettled } from './downloads/record.js';
 import { browserDownload } from './downloads/browser.js';
 import { STALLED } from './downloads/stalled.js';
+import type { Recipe } from './downloads/recipe.js';
+import { recipePreloadPath } from './preload/path.js';
 import { log } from './log.js';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -91,6 +93,22 @@ async function start(): Promise<void> {
 
   const aborts = new Map<string, AbortController>();
 
+  /**
+   * Recipes in flight, by record id — **memory only, never the manifest.**
+   *
+   * A recipe is a caller's contract with a site's markup: selectors, and sometimes the visible
+   * text of a button. None of that belongs in a file an operator reads or that is rewritten on
+   * every progress tick, so it lives here and dies with the process. The record keeps a
+   * `viaRecipe` flag and nothing else, which is what lets the engine refuse to "restart" a
+   * recipe download by downloading the page it started from.
+   *
+   * Entries are deleted by the runner below, on every path, or a daemon that runs for weeks
+   * accumulates one per download that was cancelled before its slot opened.
+   */
+  const recipes = new Map<string, Recipe>();
+  // Resolved from `import.meta.url`, once, so the path is the same whatever launched the app.
+  const recipePreload = recipePreloadPath();
+
   const downloads = new JobQueue<string, void>({
     concurrency: cfg.downloadConcurrency,
     idgen: () => randomUUID(),
@@ -102,6 +120,7 @@ async function start(): Promise<void> {
       const ac = aborts.get(id) ?? new AbortController();
       aborts.set(id, ac);
       const stopWatchdog = watchForStall(id, ac);
+      const recipe = recipes.get(id);
       try {
         await browserDownload(id, {
           store,
@@ -117,10 +136,18 @@ async function start(): Promise<void> {
           // argument is the only discriminator there is. A shared window makes the two jobs
           // indistinguishable. `test/integration/browser-download.test.ts` downloads the same
           // URL twice at once as the regression net for exactly that.
-          makeWindow: (name) => new BrowserWindow({
+          //
+          // A recipe download's window additionally gets the bridge preload — and keeps every
+          // other setting exactly as it is. `sandbox: true` in particular is not negotiable:
+          // the preload is hand-written CommonJS precisely so the sandbox can stay on (a
+          // sandboxed preload refuses ESM, and the file format was the cheaper thing to give
+          // up). `contextIsolation` keeps the bridge out of the page's reach, so a hostile
+          // renderer cannot see `ipcRenderer` or forge a step result.
+          makeWindow: (name, preload) => new BrowserWindow({
             show: false,
             webPreferences: {
               partition: `persist:${name}`,
+              ...(preload ? { preload } : {}),
               contextIsolation: true,
               nodeIntegration: false,
               sandbox: true,
@@ -128,10 +155,23 @@ async function start(): Promise<void> {
           }),
           noStartMs: cfg.downloadNoStartMs,
           stallMs: cfg.downloadStallMs,
+          ...(recipe
+            ? {
+                recipe: {
+                  recipe,
+                  stepMs: cfg.recipeStepMs,
+                  totalMs: cfg.recipeTotalMs,
+                  preload: recipePreload,
+                  ipc: ipcMain,
+                },
+              }
+            : {}),
         }, ac.signal);
       } finally {
         stopWatchdog();
         aborts.delete(id);
+        // On EVERY path, settled or cancelled: the map is the only thing holding this recipe.
+        recipes.delete(id);
         // Retention is enforced after every download, not on a timer: the thing that grows the
         // directory is a download finishing, so that is when the cap needs testing.
         await store.sweep();
@@ -214,8 +254,11 @@ async function start(): Promise<void> {
   }
 
   /** The one place that hands an id to the download queue: `/gh/fetch` and the resume below. */
-  const submitDownload = (id: string): void => {
+  const submitDownload = (id: string, recipe?: Recipe): void => {
     aborts.set(id, new AbortController());
+    // Beside the record, not on it. The restart path calls this with no recipe at all, which is
+    // exactly the case `viaRecipe` exists to make loud rather than silent.
+    if (recipe) recipes.set(id, recipe);
     // NUL-separated, the same convention the solve queue uses above -- written as an
     // escape, not a literal control character in the source. One record id is unique on
     // its own so this key cannot collide; the real dedupe is `store.findOpen`, which folds

@@ -50,6 +50,17 @@ export interface DownloadRecord {
   lastAccessAt: number;
   /** Present once a download has started and its headers have been read off the item. */
   resume?: ResumeMetadata;
+  /**
+   * True when this record's `url` is a recipe's `startUrl` rather than the file itself.
+   *
+   * The recipe is **not** persisted — it is a caller's selector contract and has no business in
+   * a manifest — so after a restart there is nothing left to re-derive the file URL with. This
+   * flag is the one bit that survives, and it exists to stop a silent wrong answer: without it
+   * a recipe record whose partial cannot be resumed would be "restarted" by downloading its
+   * `url`, which is the *page*, and settle `done` holding HTML. With it, that record fails and
+   * the caller re-POSTs its recipe. A boolean, not the steps.
+   */
+  viaRecipe?: boolean;
 }
 
 const SETTLED: ReadonlySet<DownloadState> = new Set<DownloadState>(['done', 'failed', 'cancelled']);
