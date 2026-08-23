@@ -110,3 +110,103 @@ export function validateRecipe(raw: unknown): Recipe | RecipeError {
 
   return { startUrl: target.url, steps };
 }
+
+/**
+ * The two IPC channels the recipe bridge speaks, minted once, here.
+ *
+ * They live in *this* module rather than in the preload because the preload is the one file
+ * that imports `electron` as a value, and the other side of these channels is `browser.ts`,
+ * which must never do that: it takes only `import type` from electron so its unit test can
+ * load it outside an Electron runtime. An `import { STEP_CHANNEL } from '../preload/recipe.js'`
+ * in `browser.ts` would drag `ipcRenderer.on` into the main process at import time — where
+ * `ipcRenderer` is undefined — and take `test/unit/browser.test.ts` down with it.
+ *
+ * So the pure module holds the mint and both sides import it, for the same reason `stalled.ts`
+ * holds its symbol alone: a channel name that drifts fails *silently*. The sender sends into a
+ * channel nobody listens on, the step never answers, and every recipe dies of the step timeout
+ * with a message that describes the page rather than the wiring.
+ */
+export const STEP_CHANNEL = 'gatehouse:recipe-step';
+export const RESULT_CHANNEL = 'gatehouse:recipe-result';
+
+/** What one step's execution in the page came back with. `value` is only ever read off the last. */
+export type StepResult = { ok: true; value: string | null } | { ok: false; error: string };
+
+export interface RecipeDeps {
+  /**
+   * Send one step to the page and await its result. Task 3 wires this to IPC.
+   *
+   * **It MUST settle by `deadlineMs`, and settling is the caller's job, not this module's.**
+   * Everything below measures time with the injected `now`, which means it can enforce a
+   * budget *between* steps and nothing at all *during* one: a `send` that never settles hangs
+   * the recipe past every deadline here, forever, holding its job slot. That is not
+   * hypothetical — a preload that fails to load produces exactly it, and this was measured
+   * doing so. The IPC wiring races the reply against the deadline and resolves
+   * `{ ok: false }` when the timer wins.
+   */
+  send: (step: RecipeStep, deadlineMs: number) => Promise<StepResult>;
+  stepMs: number;
+  totalMs: number;
+  now: () => number;
+}
+
+/**
+ * Run the steps in order and return the derived URL.
+ *
+ * The URL is NOT validated here — the caller does that, because it is the caller that holds
+ * the scheme gate and the caller that must refuse it. Returning it raw keeps this function
+ * about sequencing, and makes the gate impossible to skip by accident: `browser.ts` cannot use
+ * the result without passing it through `validateTarget`.
+ *
+ * Total, like `validateRecipe`: every way this can end is a value, including a `send` that
+ * rejects. A recipe runs on a daemon's job path, and a rejection escaping into a `void`ed
+ * call site there is the fault this project has already fixed three times.
+ */
+export async function runRecipe(recipe: Recipe, deps: RecipeDeps): Promise<{ url: string } | RecipeError> {
+  // `validateRecipe` cannot produce this, but the signature takes a `Recipe`, and the empty
+  // case would otherwise reach `steps[-1]` and throw out of the last message it tried to build.
+  if (recipe.steps.length === 0) return { message: 'recipe has no steps' };
+
+  const overall = deps.now() + deps.totalMs;
+  let last: string | null = null;
+
+  for (let i = 0; i < recipe.steps.length; i++) {
+    const step = recipe.steps[i]!;
+    if (deps.now() >= overall) {
+      return { message: `recipe ran out of time at step ${i} (${describe(step)}) after ${deps.totalMs}ms` };
+    }
+    // The smaller of the two budgets, so a late step cannot spend a full step timeout past the
+    // end of the overall one — the page half polls to whatever deadline it is handed.
+    const deadline = Math.min(deps.now() + deps.stepMs, overall);
+
+    let result: StepResult;
+    try {
+      result = await deps.send(step, deadline);
+    } catch (e: unknown) {
+      // A dead renderer, a window closed mid-flight, a payload that would not clone.
+      result = { ok: false, error: `could not be sent to the page (${errorText(e)})` };
+    }
+    if (!result.ok) {
+      return { message: `step ${i} (${describe(step)}) ${result.error}` };
+    }
+    last = result.value;
+  }
+
+  if (last === null || last === '') {
+    const i = recipe.steps.length - 1;
+    return { message: `step ${i} (${describe(recipe.steps[i]!)}) read an empty value` };
+  }
+  return { url: last };
+}
+
+/** For a message an operator reads at 3am: which step, and what it was looking for. */
+function describe(step: RecipeStep): string {
+  const where = step.op === 'readAttribute' ? `${step.selector}@${step.attribute}` : step.selector;
+  const text = 'text' in step && step.text ? ` text=${JSON.stringify(step.text)}` : '';
+  return `${step.op} ${where}${text}`;
+}
+
+/** Never `JSON.stringify`, and never the stack: this string goes into a job record. */
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
