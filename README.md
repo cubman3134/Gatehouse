@@ -15,8 +15,12 @@ See [the design](docs/superpowers/specs/2026-08-22-gatehouse-design.md).
 
 ## What is actually proven
 
-Increment 1 has **never been run against a live Cloudflare-protected site.** Every
-test here runs against a fake Cloudflare in `test/fixture/` — a local HTTP server
+Increment 1 **has** been run against a live Cloudflare-protected site, and so has the
+download path — see the live-verification sections further down for the measurements.
+What follows describes what the *test suite* proves on its own, which is a narrower
+thing and worth keeping separate.
+
+Every test here runs against a fake Cloudflare in `test/fixture/` — a local HTTP server
 that serves a `503` + `cf-mitigated: challenge` interstitial until a `cf_clearance`
 cookie is presented. That fixture proves the *mechanism* (a real browser clears a JS
 interstitial, the cookie is captured, the wire shape matches). It cannot prove the

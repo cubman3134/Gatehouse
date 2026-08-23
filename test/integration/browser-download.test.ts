@@ -77,7 +77,15 @@ const settle = async (base: string, id: string, ms = 60_000): Promise<JobBody> =
   for (;;) {
     const body = await job(base, id);
     if (SETTLED.includes(body.state)) return body;
-    if (Date.now() > deadline) return body;
+    // THROW on timeout rather than handing back an unsettled body. Returning it turns a
+    // "never settled" into a downstream `expected 'running' to be 'failed'`, which reads as a
+    // wrong terminal state and sends you looking in the wrong place entirely.
+    if (Date.now() > deadline) {
+      throw new Error(
+        `job ${id} never settled within ${ms}ms; last state ${body.state}, ` +
+          `received ${body.progress.received} of ${body.progress.total}`,
+      );
+    }
     await new Promise((r) => setTimeout(r, 150));
   }
 };
@@ -233,7 +241,17 @@ describe('downloading through the browser stack', () => {
       expect(settled.state).toBe('cancelled');
       expect(settled.error!.code).toBe('cancelled');
 
-      expect((await readdir(dir)).filter((f) => f.startsWith(slowId))).toEqual([]);
+      // Chromium unlinks the partial of an item it cancelled, but it does so ASYNCHRONOUSLY
+      // relative to the `done` event our record settles on — so asserting immediately here
+      // races the delete and fails roughly 1 run in 6 (observed). Poll instead: the bytes must
+      // be gone SOON, which still distinguishes "eventually deleted" from "leaked on disk".
+      const goneBy = Date.now() + 10_000;
+      let leftover = (await readdir(dir)).filter((f) => f.startsWith(slowId));
+      while (leftover.length > 0 && Date.now() < goneBy) {
+        await new Promise((r) => setTimeout(r, 100));
+        leftover = (await readdir(dir)).filter((f) => f.startsWith(slowId));
+      }
+      expect(leftover, 'the cancelled download left bytes on disk').toEqual([]);
     } finally {
       await slowHost.close();
     }
@@ -288,10 +306,23 @@ describe('a host that never starts the download', () => {
       // longer than the TTL before dying would then be reclaimable the instant it settled, and
       // could vanish before the caller polled. Nothing on `/gh/jobs/:id` exposes the field, so
       // this reads the manifest — which is the same file the sweep reads.
-      const manifest = JSON.parse(
-        await readFile(join(silentDir, 'manifest.json'), 'utf8'),
-      ) as Array<{ id: string; state: string; createdAt: number; completedAt: number | null }>;
-      const record = manifest.find((r) => r.id === silentId);
+      // The manifest is written ASYNCHRONOUSLY — `store.save()` serialises behind a promise
+      // chain — so the API reports a settled job before the write lands, and reading here
+      // immediately races it (observed failing ~1 run in 8, as `expected 'running' to be
+      // 'failed'`, which reads as a wrong terminal state rather than as a stale read). Poll
+      // for the write instead; what is being proven is that `completedAt` gets stamped, not
+      // how promptly the file catches up.
+      type ManifestRow = { id: string; state: string; createdAt: number; completedAt: number | null };
+      const manifestBy = Date.now() + 10_000;
+      let record: ManifestRow | undefined;
+      for (;;) {
+        const manifest = JSON.parse(
+          await readFile(join(silentDir, 'manifest.json'), 'utf8'),
+        ) as ManifestRow[];
+        record = manifest.find((r) => r.id === silentId);
+        if (record?.state === 'failed' || Date.now() > manifestBy) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
       expect(record, 'the failed record is not in the manifest').toBeDefined();
       expect(record!.state).toBe('failed');
       expect(record!.completedAt).not.toBeNull();

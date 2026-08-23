@@ -299,7 +299,13 @@ export async function browserDownload(
                   await finish(failedPatch(error.code, error.message, receivedOf(dl)));
                 }
               } else if (signal.reason === STALLED) {
-                await settleStalled(0);
+                // The bytes Chromium reported before it was cancelled, NOT 0. The record's
+              // `received` legitimately becomes 0 because Chromium deletes the partial, but the
+              // LOG has to say where the transfer actually got to — "stopped advancing" with
+              // "received 0" reads as "never started" and misdirects the diagnosis of a stall
+              // at 95%.
+              log.warn('download stalled', { id, reachedBytes: receivedOf(dl) });
+              await settleStalled(0);
               } else if (signal.aborted) {
                 await settleCancelled();
               } else {
