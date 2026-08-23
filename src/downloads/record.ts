@@ -2,6 +2,25 @@ import type { FailureCode, JobError } from '../jobs/queue.js';
 
 export type DownloadState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 
+/**
+ * What `session.createInterruptedDownload` needs to pick a transfer back up. Chromium keeps
+ * none of this across a restart — there is no enumeration API and no `will-download` on
+ * startup — so we persist it ourselves or resume is impossible.
+ */
+export interface ResumeMetadata {
+  urlChain: string[];
+  mimeType: string;
+  /** Empty when the server sent none. */
+  eTag: string;
+  /** Empty when the server sent none. */
+  lastModified: string;
+  /** Floored to integer seconds — Chromium rejects a fractional startTime. */
+  startTimeSec: number;
+  /** 0 when the server sent no Content-Length. */
+  totalBytes: number;
+  receivedBytes: number;
+}
+
 export interface DownloadRecord {
   /** Opaque id. This is the caller's handle and the on-disk basename — never a remote name. */
   id: string;
@@ -24,6 +43,8 @@ export interface DownloadRecord {
   completedAt: number | null;
   /** Bumped whenever the bytes are served, so the size-cap sweep can evict least-recently-used. */
   lastAccessAt: number;
+  /** Present once a transfer has started and reported its headers. */
+  resume?: ResumeMetadata;
 }
 
 const SETTLED: ReadonlySet<DownloadState> = new Set<DownloadState>(['done', 'failed', 'cancelled']);
