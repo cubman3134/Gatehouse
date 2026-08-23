@@ -20,11 +20,14 @@ import type { AddressInfo, Socket } from 'node:net';
  *               site-controlled input, and this is what the scheme gate is for.
  * - `never`   — the button is there and nothing is ever revealed. The step timeout is the only
  *               thing that ends this.
+ * - `duringLoad` — the download starts **while the page is still loading**, with no click at
+ *               all. This is the only mode that lands before `loadURL` resolves, which is what
+ *               makes it the one that can see the handler-ordering rule. See below.
  *
  * The delay is deliberate rather than incidental: a link that appears synchronously inside the
  * click would let a `waitFor` that never polls pass anyway.
  */
-export type RecipeHostMode = 'reveal' | 'direct' | 'hostile' | 'never';
+export type RecipeHostMode = 'reveal' | 'direct' | 'hostile' | 'never' | 'duringLoad';
 
 export interface RecipeHost {
   /** The page a recipe starts at. */
@@ -52,6 +55,44 @@ export const HOSTILE_HREF = 'file:///C:/Windows/win.ini';
  * for the same reason the engine builds no script out of a selector.
  */
 function page(mode: RecipeHostMode, revealMs: number): string {
+  /**
+   * `duringLoad`: a subframe navigation to the `attachment` response, issued as part of the
+   * document's own load.
+   *
+   * **Four mechanisms were measured; only this one is in the right place in time.** What the
+   * mode has to do is start the download *strictly before `wc.loadURL()` resolves*, because
+   * that is the only window in which "attached before the navigation" and "attached after it"
+   * differ at all. Against the real app:
+   *
+   * | mechanism | correct code | `will-download` attached after `loadURL` |
+   * |---|---|---|
+   * | `Content-Disposition: attachment` on `startUrl` | **fails** — `loadURL` rejects `ERR_FAILED (-2)` | fails the same way |
+   * | `<meta http-equiv="refresh" content="0;…">` | done, 170ms | done — still caught |
+   * | `location.href` on `DOMContentLoaded` | done, 156ms | done — still caught |
+   * | `location.href` at parse time | done, 168ms | done — still caught |
+   * | `<iframe src="/file.bin">` (this one) | done, 170ms | **fails**, 2.2s |
+   *
+   * A top-level navigation to a download does not abort the page load — Chromium leaves the
+   * document alone and turns the request into an item — but it also lands *after* the load
+   * finishes, so a late attach catches all three of those. Serving the attachment as `startUrl`
+   * itself is the opposite failure: the navigation never commits, `loadURL` rejects, and the
+   * recipe fails for a reason that has nothing to do with the handler.
+   *
+   * A subframe load is part of the parent's load. The item exists before `did-finish-load`, so
+   * a handler attached after `loadURL` is genuinely too late for it — which is exactly the
+   * measured production hazard: an unclaimed item raises a native modal Save As dialog on a
+   * daemon with no one to click it.
+   */
+  if (mode === 'duringLoad') {
+    return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>recipe fixture (duringLoad)</title></head>
+<body>
+  <p id="slot"></p>
+  <button id="go">Download</button>
+  <iframe src="/file.bin" hidden></iframe>
+</body></html>`;
+  }
+
   const reveal = (href: string): string =>
     `setTimeout(function () {
        var a = document.createElement('a');

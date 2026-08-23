@@ -123,9 +123,11 @@ describe('a click that starts the download itself', () => {
    * `readAttribute` can never succeed — and must not need to. An item that arrives mid-recipe
    * IS the result, the remaining steps are abandoned, and the job completes on the bytes.
    *
-   * This is also the regression net for handler ordering: `will-download` is attached before
-   * anything navigates, because an unclaimed item opens a native modal Save As dialog that
-   * never resolves. Attach it after `loadURL` and this test hangs instead of passing.
+   * It is NOT the regression net for handler ordering, though it was written expecting to be:
+   * the click that starts this download happens long after `loadURL` has resolved, so moving
+   * the `will-download` attach after the navigation leaves this test green. That rule is pinned
+   * by the `duringLoad` test below, which is the only one whose download lands inside the
+   * interval where the ordering makes a difference.
    */
   it('completes on the item rather than on a readAttribute that never happens', async () => {
     const host = await startRecipeHost({ mode: 'direct', body: BODY, filename: 'direct.bin' });
@@ -138,6 +140,79 @@ describe('a click that starts the download itself', () => {
       expect(done.result!.sha256).toBe(SHA);
       expect(done.result!.size).toBe(BODY.length);
       expect((await stat(done.result!.path)).size).toBe(BODY.length);
+
+      await fetch(`${gh.url}/gh/jobs/${id}`, { method: 'DELETE' });
+    } finally {
+      await host.close();
+    }
+  }, 120_000);
+});
+
+describe('a download that starts while the page is still loading', () => {
+  /**
+   * **The test that pins handler ordering, and the only one that can.**
+   *
+   * `will-download` is attached before `wc.loadURL()` runs, and that placement is the whole
+   * rule: an item nobody claims makes Chromium open a native modal Save As dialog that never
+   * resolves — on a headless daemon that is a wedged job behind a window no one can see or
+   * dismiss. Every other recipe test here starts its download from a *click*, which happens
+   * long after the load, so all of them stay green with the handler attached late. They do not
+   * test the rule; this one does.
+   *
+   * The fixture's download begins during the page's own load, so it lands in the one interval
+   * where "before the navigation" and "after it" differ. Move the attach after `loadURL` and
+   * this goes red: the item is missed, no `a#link` ever appears, and the job fails
+   * `recipe-failed` on the `waitFor` step deadline instead of completing on the bytes.
+   *
+   * Everything below is bounded by a deadline of this test's own, per request as well as
+   * overall, because the failure this guards against is a *hang*: if an unclaimed item ever did
+   * block the main process, the poll must fail as our timeout rather than as vitest's.
+   */
+  const boundedSettle = async (base: string, id: string, ms: number): Promise<JobBody> => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      let body: JobBody;
+      try {
+        const res = await fetch(`${base}/gh/jobs/${id}`, { signal: AbortSignal.timeout(5_000) });
+        body = (await res.json()) as JobBody;
+      } catch (e: unknown) {
+        // A main process wedged behind a modal dialog stops answering. Name that, rather than
+        // letting it read as a network blip.
+        throw new Error(
+          `polling job ${id} failed after ${ms - (deadline - Date.now())}ms — the app stopped ` +
+            `answering, which is what an unclaimed download item looks like: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      if (SETTLED.includes(body.state)) return body;
+      if (Date.now() > deadline) {
+        throw new Error(`job ${id} never settled within ${ms}ms; last state ${body.state}`);
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  };
+
+  it('claims the item even though nothing clicked, and completes on its bytes', async () => {
+    const host = await startRecipeHost({ mode: 'duringLoad', body: BODY, filename: 'duringload.bin' });
+    const started = Date.now();
+    try {
+      const id = await fetchRecipe(gh.url, host.url, 'during-load');
+      const done = await boundedSettle(gh.url, id, 45_000);
+      const took = Date.now() - started;
+
+      expect(done.error, `expected the item to be claimed, not a recipe failure`).toBeUndefined();
+      expect(done.state).toBe('done');
+      // The hash again: the page and the file are served from one origin, so a job that
+      // downloaded the *page* would settle `done` just as happily.
+      expect(done.result!.sha256).toBe(SHA);
+      expect(done.result!.size).toBe(BODY.length);
+      expect((await stat(done.result!.path)).size).toBe(BODY.length);
+      expect(done.result!.filename).toBe('duringload.bin');
+
+      // It completed on the ITEM, not on a step. No `a#link` exists on this page, so a job
+      // that waited for the recipe would have spent the whole 15s step deadline and failed.
+      // This bound is what says the item was claimed the moment it appeared.
+      expect(took, `the item was not claimed during the load: it took ${took}ms`).toBeLessThan(10_000);
 
       await fetch(`${gh.url}/gh/jobs/${id}`, { method: 'DELETE' });
     } finally {
