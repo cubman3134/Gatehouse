@@ -194,7 +194,14 @@ export async function runRecipe(recipe: Recipe, deps: RecipeDeps): Promise<{ url
 
     let result: StepResult;
     try {
-      result = await deps.send(step, deadline);
+      const sent = await deps.send(step, deadline);
+      // `send` is supplied by wiring this module does not own, so a malformed resolution is
+      // treated the same as a rejection. Reading `.ok` off `undefined` would throw a TypeError
+      // out of a function that advertises totality, on a job path that is `void`ed.
+      result =
+        typeof sent === 'object' && sent !== null && typeof (sent as StepResult).ok === 'boolean'
+          ? (sent as StepResult)
+          : { ok: false, error: 'the page bridge returned a malformed result' };
     } catch (e: unknown) {
       // A dead renderer, a window closed mid-flight, a payload that would not clone.
       result = { ok: false, error: `could not be sent to the page (${errorText(e)})` };
